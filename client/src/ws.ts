@@ -5,6 +5,12 @@ export interface VoxwireClientHandlers {
   onMessage: (data: unknown) => void;
 }
 
+export interface AudioFormat {
+  encoding: string;
+  sampleRate: number;
+  channels: number;
+}
+
 const WS_BASE = import.meta.env.VITE_WS_BASE ?? "ws://localhost:8000";
 
 /** Thin WebSocket wrapper for a single voxwire session. */
@@ -20,6 +26,10 @@ export class VoxwireClient {
 
   get id(): string {
     return this.sessionId;
+  }
+
+  get connected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
   }
 
   connect(): void {
@@ -49,14 +59,45 @@ export class VoxwireClient {
     this.ws = null;
   }
 
-  send(message: Record<string, unknown>): void {
+  /** Build a protocol envelope with the common fields filled in. */
+  private envelope(type: string, turnId: string | null, extra: Record<string, unknown> = {}) {
+    return {
+      type,
+      sessionId: this.sessionId,
+      turnId,
+      timestamp: Date.now(),
+      ...extra,
+    };
+  }
+
+  private send(message: Record<string, unknown>): void {
     if (this.ws?.readyState !== WebSocket.OPEN) {
       throw new Error("WebSocket is not open");
     }
     this.ws.send(JSON.stringify(message));
   }
 
+  /** Announce the upstream audio format once, right after connecting. */
+  sessionStart(audio: AudioFormat): void {
+    this.send(
+      this.envelope("session_start", null, {
+        audio,
+        client: { userAgent: navigator.userAgent, appVersion: "0.1.0" },
+      }),
+    );
+  }
+
+  /** Stream one slice of captured audio for the given turn. */
+  audioChunk(turnId: string, seq: number, base64Data: string): void {
+    this.send(this.envelope("audio_chunk", turnId, { seq, data: base64Data }));
+  }
+
+  /** Signal that the user released push-to-talk; no more chunks this turn. */
+  utteranceEnd(turnId: string, totalChunks: number): void {
+    this.send(this.envelope("utterance_end", turnId, { totalChunks }));
+  }
+
   ping(): void {
-    this.send({ type: "ping", payload: { sentAt: Date.now() } });
+    this.send(this.envelope("ping", null, { payload: { sentAt: Date.now() } }));
   }
 }

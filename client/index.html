@@ -49,6 +49,21 @@
       }
       button:disabled { opacity: 0.45; cursor: not-allowed; }
       button.secondary { background: #262b36; }
+      .talk {
+        width: 100%;
+        padding: 16px;
+        font-size: 15px;
+        background: #262b36;
+        user-select: none;
+        touch-action: none;
+      }
+      .talk.recording { background: var(--err); }
+      .mic-error {
+        color: var(--err);
+        font-size: 13px;
+        margin: 0 0 14px;
+        min-height: 16px;
+      }
       .status {
         display: inline-flex;
         align-items: center;
@@ -81,7 +96,7 @@
   <body>
     <main class="card">
       <h1>voxwire</h1>
-      <p class="sub">Phase 0 — transport check. Connect and round-trip a ping.</p>
+      <p class="sub">Connect, then hold the button and speak. Audio streams to the server.</p>
 
       <div class="row">
         <button id="connect">Connect</button>
@@ -91,6 +106,11 @@
           <span id="statusText">disconnected</span>
         </span>
       </div>
+
+      <div class="row">
+        <button id="talk" class="talk" disabled>Hold to talk</button>
+      </div>
+      <p id="micError" class="mic-error"></p>
 
       <div id="log"></div>
     </main>

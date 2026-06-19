@@ -1,7 +1,17 @@
 import { VoxwireClient, type ConnectionStatus } from "./ws";
+import {
+  AudioCapture,
+  CaptureError,
+  arrayBufferToBase64,
+  CAPTURE_CHANNELS,
+  CAPTURE_ENCODING,
+  CAPTURE_SAMPLE_RATE,
+} from "./audio";
 
 const connectBtn = document.getElementById("connect") as HTMLButtonElement;
 const pingBtn = document.getElementById("ping") as HTMLButtonElement;
+const talkBtn = document.getElementById("talk") as HTMLButtonElement;
+const micError = document.getElementById("micError") as HTMLParagraphElement;
 const dot = document.getElementById("dot") as HTMLSpanElement;
 const statusText = document.getElementById("statusText") as HTMLSpanElement;
 const logEl = document.getElementById("log") as HTMLDivElement;
@@ -20,14 +30,22 @@ function setStatus(status: ConnectionStatus): void {
   statusText.textContent = status;
   const connected = status === "connected";
   pingBtn.disabled = !connected;
+  talkBtn.disabled = !connected;
   connectBtn.textContent = connected ? "Disconnect" : "Connect";
   connectBtn.disabled = status === "connecting";
 }
 
 let client: VoxwireClient | null = null;
+const capture = new AudioCapture();
+
+// Per-utterance state, set on push-to-talk press.
+let turnId: string | null = null;
+let seq = 0;
+let holding = false;
 
 connectBtn.addEventListener("click", () => {
   if (client) {
+    void stopTalking();
     client.disconnect();
     client = null;
     return;
@@ -35,7 +53,16 @@ connectBtn.addEventListener("click", () => {
   client = new VoxwireClient({
     onStatus: (status) => {
       setStatus(status);
-      if (status === "connected") log(`connected (session ${client?.id})`, "sys");
+      if (status === "connected") {
+        log(`connected (session ${client?.id})`, "sys");
+        // Declare the upstream audio format as soon as the socket is open.
+        client?.sessionStart({
+          encoding: CAPTURE_ENCODING,
+          sampleRate: CAPTURE_SAMPLE_RATE,
+          channels: CAPTURE_CHANNELS,
+        });
+        log("-> session_start", "out");
+      }
       if (status === "disconnected") log("disconnected", "sys");
       if (status === "error") log("connection error", "sys");
     },
@@ -49,5 +76,60 @@ pingBtn.addEventListener("click", () => {
   client.ping();
   log("-> ping", "out");
 });
+
+async function startTalking(): Promise<void> {
+  if (!client?.connected || holding) return;
+  holding = true;
+  turnId = crypto.randomUUID();
+  seq = 0;
+  micError.textContent = "";
+  talkBtn.classList.add("recording");
+  talkBtn.textContent = "Recording… release to send";
+
+  try {
+    await capture.start((pcm) => {
+      // The capture may outlive the press by one flushed chunk; guard turnId.
+      if (!client?.connected || turnId === null) return;
+      client.audioChunk(turnId, seq, arrayBufferToBase64(pcm));
+      seq += 1;
+    });
+    log(`-> audio capture started (turn ${turnId})`, "out");
+  } catch (err) {
+    holding = false;
+    resetTalkButton();
+    const message = err instanceof CaptureError ? err.message : "Could not start microphone.";
+    micError.textContent = message;
+    log(`mic error: ${message}`, "sys");
+  }
+}
+
+async function stopTalking(): Promise<void> {
+  if (!holding) return;
+  holding = false;
+  resetTalkButton();
+
+  const endedTurn = turnId;
+  await capture.stop(); // flushes the final partial chunk through onChunk
+  turnId = null;
+
+  if (client?.connected && endedTurn) {
+    client.utteranceEnd(endedTurn, seq);
+    log(`-> utterance_end (${seq} chunks)`, "out");
+  }
+}
+
+function resetTalkButton(): void {
+  talkBtn.classList.remove("recording");
+  talkBtn.textContent = "Hold to talk";
+}
+
+// Pointer events cover mouse + touch; releasing or leaving the button ends the turn.
+talkBtn.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  void startTalking();
+});
+talkBtn.addEventListener("pointerup", () => void stopTalking());
+talkBtn.addEventListener("pointerleave", () => void stopTalking());
+talkBtn.addEventListener("pointercancel", () => void stopTalking());
 
 setStatus("disconnected");
