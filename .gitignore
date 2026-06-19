@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+.pytest_cache/
+.ruff_cache/
+
+# Node / client
+node_modules/
+client/dist/
+*.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Recordings captured at runtime (keep the directory, ignore generated files)
+recordings/*
+!recordings/.gitkeep
+!recordings/samples/
