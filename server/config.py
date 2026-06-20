@@ -32,16 +32,14 @@ class Settings(BaseSettings):
     log_level: str = "info"
 
     # --- Provider selection (swap stages without touching code) ---
-    asr_provider: str = "deepgram"  # deepgram | whisper
-    llm_provider: str = "gemini"  # gemini | openai
-    tts_provider: str = "cartesia"  # cartesia | elevenlabs
+    asr_provider: str = "deepgram"  # deepgram
+    llm_provider: str = "gemini"  # gemini
+    tts_provider: str = "cartesia"  # cartesia
 
     # --- Provider credentials (optional until the stage runs) ---
     deepgram_api_key: str | None = None
-    openai_api_key: str | None = None
     gemini_api_key: str | None = None
     cartesia_api_key: str | None = None
-    elevenlabs_api_key: str | None = None
 
     # --- Observability (Phase 2, optional) ---
     langfuse_public_key: str | None = None
@@ -51,8 +49,6 @@ class Settings(BaseSettings):
     # Maps a logical credential name to the attribute that holds it.
     _KEY_ATTRS = {
         "deepgram": "deepgram_api_key",
-        "whisper": "openai_api_key",  # Whisper via OpenAI API
-        "openai": "openai_api_key",
         "gemini": "gemini_api_key",
         "cartesia": "cartesia_api_key",
         "elevenlabs": "elevenlabs_api_key",
