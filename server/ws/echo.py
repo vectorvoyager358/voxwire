@@ -7,23 +7,32 @@ base64 payloads back:
 
 - ``session_start`` -> logged; the declared audio format is remembered.
 - ``audio_chunk``   -> counted (chunks + decoded bytes); never echoed.
-- ``utterance_end`` -> answered with a small ``capture_summary`` so the client
-  can confirm the server received a clean stream for the turn.
+- ``utterance_end`` -> answered with a small ``capture_summary``; then a
+  **mock** TTS reply is streamed back as ``tts_audio_chunk`` events followed by
+  ``turn_complete``, so the client's playback queue (issue #7) can be exercised
+  before real TTS (issue #10) exists.
 
 The real ASR/LLM/TTS pipeline (issues #8-#11) will replace this receiver.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import logging
+import math
+import struct
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 logger = logging.getLogger("voxwire.ws")
+
+# Mock TTS downstream format (matches docs/event-protocol.md: 24 kHz mono PCM16).
+TTS_SAMPLE_RATE = 24000
+_TTS_CHUNK_MS = 120
 
 
 def _now_iso() -> str:
@@ -89,6 +98,8 @@ async def echo_session(websocket: WebSocket, session_id: str) -> None:
                         **summary,
                     }
                 )
+                # Stand-in for the real TTS stage so issue #7 playback is testable.
+                await _stream_mock_tts(websocket, session_id, summary["turnId"])
 
             else:
                 # Unknown / Phase 0 messages: echo back for visibility.
@@ -138,3 +149,58 @@ def _finish_turn(stats: _TurnStats, message: dict) -> dict:
     }
     stats.turn_id = None
     return summary
+
+
+def _make_tone() -> list[int]:
+    """A short, continuous-phase five-note arpeggio as PCM16 samples.
+
+    Phase carries across note boundaries so there are no clicks within the
+    reply; any gap or overlap the client introduces between chunks would
+    therefore be audible — exactly what issue #7 needs to verify.
+    """
+    notes = (440, 554, 659, 554, 440)  # A4, C#5, E5, C#5, A4
+    note_samples = TTS_SAMPLE_RATE // 2  # 0.5 s per note
+    amplitude = 0.25
+    samples: list[int] = []
+    phase = 0.0
+    for freq in notes:
+        step = 2 * math.pi * freq / TTS_SAMPLE_RATE
+        for _ in range(note_samples):
+            samples.append(int(amplitude * 32767 * math.sin(phase)))
+            phase += step
+    return samples
+
+
+async def _stream_mock_tts(websocket: WebSocket, session_id: str, turn_id: str | None) -> None:
+    """Stream a mock TTS reply as ``tts_audio_chunk`` events + ``turn_complete``."""
+    tone = _make_tone()
+    samples_per_chunk = TTS_SAMPLE_RATE * _TTS_CHUNK_MS // 1000
+    seq = 0
+    for start in range(0, len(tone), samples_per_chunk):
+        block = tone[start : start + samples_per_chunk]
+        raw = struct.pack(f"<{len(block)}h", *block)
+        await websocket.send_json(
+            {
+                "type": "tts_audio_chunk",
+                "sessionId": session_id,
+                "turnId": turn_id,
+                "timestamp": _now_iso(),
+                "seq": seq,
+                "encoding": "pcm_s16le",
+                "sampleRate": TTS_SAMPLE_RATE,
+                "data": base64.b64encode(raw).decode(),
+            }
+        )
+        seq += 1
+        # Stream faster than real time so the client's queue stays ahead.
+        await asyncio.sleep(_TTS_CHUNK_MS / 1000 / 2)
+
+    await websocket.send_json(
+        {
+            "type": "turn_complete",
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "timestamp": _now_iso(),
+            "meta": {"degraded": False, "ttsSkipped": False, "mock": True, "ttsChunks": seq},
+        }
+    )

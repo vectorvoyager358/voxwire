@@ -7,6 +7,7 @@ import {
   CAPTURE_ENCODING,
   CAPTURE_SAMPLE_RATE,
 } from "./audio";
+import { TtsPlayer } from "./playback";
 
 const connectBtn = document.getElementById("connect") as HTMLButtonElement;
 const pingBtn = document.getElementById("ping") as HTMLButtonElement;
@@ -37,6 +38,32 @@ function setStatus(status: ConnectionStatus): void {
 
 let client: VoxwireClient | null = null;
 const capture = new AudioCapture();
+const player = new TtsPlayer((info) => log(`playback_start (turn ${info.turnId})`, "sys"));
+
+interface ServerMessage {
+  type?: string;
+  turnId?: string;
+  seq?: number;
+  data?: string;
+  sampleRate?: number;
+}
+
+function handleMessage(data: unknown): void {
+  const msg = data as ServerMessage;
+  switch (msg?.type) {
+    case "tts_audio_chunk":
+      if (typeof msg.turnId === "string" && typeof msg.data === "string") {
+        player.enqueue(msg.turnId, msg.seq ?? 0, msg.data, msg.sampleRate);
+        if ((msg.seq ?? 0) === 0) log(`<- tts_audio_chunk stream (turn ${msg.turnId})`, "in");
+      }
+      return;
+    case "turn_complete":
+      log(`<- turn_complete (turn ${msg.turnId})`, "in");
+      return;
+    default:
+      log(`<- ${JSON.stringify(data)}`, "in");
+  }
+}
 
 // Per-utterance state, set on push-to-talk press.
 let turnId: string | null = null;
@@ -46,6 +73,7 @@ let holding = false;
 connectBtn.addEventListener("click", () => {
   if (client) {
     void stopTalking();
+    player.reset();
     client.disconnect();
     client = null;
     return;
@@ -66,7 +94,7 @@ connectBtn.addEventListener("click", () => {
       if (status === "disconnected") log("disconnected", "sys");
       if (status === "error") log("connection error", "sys");
     },
-    onMessage: (data) => log(`<- ${JSON.stringify(data)}`, "in"),
+    onMessage: handleMessage,
   });
   client.connect();
 });
@@ -80,6 +108,8 @@ pingBtn.addEventListener("click", () => {
 async function startTalking(): Promise<void> {
   if (!client?.connected || holding) return;
   holding = true;
+  // This press is a user gesture: unlock playback so the TTS reply can sound.
+  void player.unlock();
   turnId = crypto.randomUUID();
   seq = 0;
   micError.textContent = "";

@@ -44,8 +44,6 @@ The default stack can be built and demoed at **$0**, no credit card required:
 | LLM | Gemini | Free tier on Flash models (~1,500 requests/day), no card |
 | TTS | Cartesia | 20K credits/mo (~27 min of speech), no card, non-commercial |
 
-Note: Cartesia's free tier is non-commercial. OpenAI (the alternate LLM) has no
-free tier and requires prepaid credits.
 
 ## Local setup
 
