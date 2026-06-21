@@ -93,8 +93,10 @@ export class VoxwireClient {
   }
 
   /** Signal that the user released push-to-talk; no more chunks this turn. */
-  utteranceEnd(turnId: string, totalChunks: number): void {
-    this.send(this.envelope("utterance_end", turnId, { totalChunks }));
+  utteranceEnd(turnId: string, totalChunks: number, captureMs?: number): void {
+    const extra: Record<string, unknown> = { totalChunks };
+    if (captureMs !== undefined) extra.captureMs = captureMs;
+    this.send(this.envelope("utterance_end", turnId, extra));
   }
 
   ping(): void {

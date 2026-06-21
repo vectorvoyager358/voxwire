@@ -8,6 +8,7 @@ import {
   CAPTURE_SAMPLE_RATE,
 } from "./audio";
 import { TtsPlayer } from "./playback";
+import { LatencyUi, type LatencyReport } from "./latency-ui";
 
 const connectBtn = document.getElementById("connect") as HTMLButtonElement;
 const pingBtn = document.getElementById("ping") as HTMLButtonElement;
@@ -20,13 +21,23 @@ const chatLog = document.getElementById("chatLog") as HTMLDivElement;
 const chatScroll = document.getElementById("chatScroll") as HTMLDivElement;
 const pipelineStateEl = document.getElementById("pipelineState") as HTMLParagraphElement;
 const bannerEl = document.getElementById("banner") as HTMLParagraphElement;
+const latencyStats = document.getElementById("latencyStats") as HTMLDivElement;
+const latencyWaterfall = document.getElementById("latencyWaterfall") as HTMLDivElement;
+const latencyTableBody = document.getElementById("latencyTableBody") as HTMLTableSectionElement;
 
-type PipelineState = "idle" | "listening" | "thinking" | "speaking" | "error";
+interface LatencySummaryMeta {
+  totalMs?: number;
+  bottleneckStage?: string | null;
+  failedStage?: string | null;
+  degraded?: boolean;
+}
 
 interface TurnCompleteMeta {
   degraded?: boolean;
   ttsSkipped?: boolean;
   ttsChunks?: number;
+  latency?: LatencySummaryMeta;
+  latency_report?: LatencyReport;
 }
 
 interface ServerMessage {
@@ -39,14 +50,22 @@ interface ServerMessage {
   stage?: string;
   message?: string;
   recoverable?: boolean;
-  meta?: TurnCompleteMeta;
+  meta?: TurnCompleteMeta | LatencySummaryMeta;
+  totalMs?: number;
+  bottleneckStage?: string | null;
+  failedStage?: string | null;
+  stages?: LatencyReport["stages"];
 }
+
+type PipelineState = "idle" | "listening" | "thinking" | "speaking" | "error";
 
 interface ActiveTurn {
   turnId: string;
   root: HTMLDivElement;
   you: HTMLSpanElement;
+  youCopy: HTMLButtonElement;
   assistant: HTMLSpanElement;
+  assistantCopy: HTMLButtonElement;
   footnote: HTMLParagraphElement;
   assistantText: string;
 }
@@ -56,6 +75,7 @@ interface TalkSession {
   turnId: string;
   seq: number;
   micReady: boolean;
+  captureStartAt: number;
 }
 
 function log(text: string, kind: "in" | "out" | "sys" = "sys"): void {
@@ -98,7 +118,15 @@ function setStatus(status: ConnectionStatus): void {
 
 let client: VoxwireClient | null = null;
 const capture = new AudioCapture();
+const latencyUi = new LatencyUi(latencyStats, latencyWaterfall, latencyTableBody);
+const utteranceEndAt = new Map<string, number>();
+const feltLatencyMs = new Map<string, number>();
+
 const player = new TtsPlayer((info) => {
+  const endAt = utteranceEndAt.get(info.turnId);
+  if (endAt != null) {
+    feltLatencyMs.set(info.turnId, Math.max(0, info.at - endAt));
+  }
   log(`playback_start (turn ${info.turnId})`, "sys");
   setPipelineState("speaking");
 });
@@ -110,16 +138,70 @@ function scrollChatToBottom(): void {
   chatScroll.scrollTop = chatScroll.scrollHeight;
 }
 
-function makeBubble(who: string, extraClass = ""): { root: HTMLDivElement; text: HTMLSpanElement } {
+const COPY_ICON = `<svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+
+const COPIED_ICON = `<svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`;
+
+function setCopyButtonIcon(btn: HTMLButtonElement, copied = false): void {
+  btn.innerHTML = copied ? COPIED_ICON : COPY_ICON;
+}
+
+async function copyMessage(btn: HTMLButtonElement, textEl: HTMLSpanElement): Promise<void> {
+  const text = textEl.textContent?.trim();
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.left = "-9999px";
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
+  setCopyButtonIcon(btn, true);
+  btn.classList.add("copied");
+  window.setTimeout(() => {
+    setCopyButtonIcon(btn, false);
+    btn.classList.remove("copied");
+  }, 1500);
+}
+
+function syncCopyButton(btn: HTMLButtonElement, text: string): void {
+  btn.disabled = !text.trim();
+}
+
+function makeBubble(
+  who: string,
+  extraClass = "",
+): { root: HTMLDivElement; text: HTMLSpanElement; copyBtn: HTMLButtonElement } {
   const root = document.createElement("div");
   root.className = `bubble ${extraClass}`.trim();
+
+  const head = document.createElement("div");
+  head.className = "bubble-head";
+
   const label = document.createElement("span");
   label.className = "who";
   label.textContent = who;
+
   const text = document.createElement("span");
   text.className = "text";
-  root.append(label, text);
-  return { root, text };
+
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "copy-btn";
+  copyBtn.setAttribute("aria-label", `Copy ${who} message`);
+  copyBtn.title = "Copy";
+  setCopyButtonIcon(copyBtn);
+  copyBtn.disabled = true;
+  copyBtn.addEventListener("click", () => void copyMessage(copyBtn, text));
+
+  head.append(label, copyBtn);
+  root.append(head, text);
+  return { root, text, copyBtn };
 }
 
 function ensureTurn(turnId: string): ActiveTurn {
@@ -140,7 +222,9 @@ function ensureTurn(turnId: string): ActiveTurn {
     turnId,
     root: block,
     you: youBubble.text,
+    youCopy: youBubble.copyBtn,
     assistant: assistantBubble.text,
+    assistantCopy: assistantBubble.copyBtn,
     footnote,
     assistantText: "",
   };
@@ -157,6 +241,7 @@ function setYou(text: string, final: boolean): void {
   if (!activeTurn) return;
   activeTurn.you.textContent = text;
   activeTurn.you.classList.toggle("partial", !final);
+  syncCopyButton(activeTurn.youCopy, text);
   scrollChatToBottom();
 }
 
@@ -164,6 +249,7 @@ function appendAssistant(text: string): void {
   if (!activeTurn) return;
   activeTurn.assistantText += text;
   activeTurn.assistant.textContent = activeTurn.assistantText;
+  syncCopyButton(activeTurn.assistantCopy, activeTurn.assistantText);
   scrollChatToBottom();
 }
 
@@ -171,6 +257,7 @@ function setAssistantComplete(text: string): void {
   if (!activeTurn) return;
   activeTurn.assistantText = text;
   activeTurn.assistant.textContent = text;
+  syncCopyButton(activeTurn.assistantCopy, text);
   scrollChatToBottom();
 }
 
@@ -196,8 +283,19 @@ function resetSessionUi(): void {
   clearChat();
   hideBanner();
   pttBlocked = false;
+  utteranceEndAt.clear();
+  feltLatencyMs.clear();
+  latencyUi.clear();
   setPipelineState("idle");
   setTalkEnabled(client?.connected ?? false);
+}
+
+function ingestLatencyReport(
+  turnId: string,
+  report: LatencyReport,
+  degraded: boolean,
+): void {
+  latencyUi.recordTurn(turnId, report, feltLatencyMs.get(turnId) ?? null, degraded);
 }
 
 function handleMessage(data: unknown): void {
@@ -230,6 +328,23 @@ function handleMessage(data: unknown): void {
         if ((msg.seq ?? 0) === 0) log(`<- tts_audio_chunk stream (turn ${msg.turnId})`, "in");
       }
       return;
+    case "latency_report": {
+      if (typeof msg.turnId !== "string" || msg.totalMs == null || !msg.stages) return;
+      const report: LatencyReport = {
+        totalMs: msg.totalMs,
+        bottleneckStage: msg.bottleneckStage,
+        failedStage: msg.failedStage,
+        stages: msg.stages,
+        meta: msg.meta,
+      };
+      ingestLatencyReport(
+        msg.turnId,
+        report,
+        (msg.meta as LatencySummaryMeta | undefined)?.degraded ?? msg.failedStage != null,
+      );
+      log(`<- latency_report total=${msg.totalMs}ms`, "in");
+      return;
+    }
     case "turn_complete": {
       finishTurn(msg.meta);
       if (msg.meta?.degraded) {
@@ -323,7 +438,12 @@ pingBtn.addEventListener("click", () => {
 async function startTalking(): Promise<void> {
   if (!client?.connected || pttBlocked || talkSession) return;
 
-  const session: TalkSession = { turnId: crypto.randomUUID(), seq: 0, micReady: false };
+  const session: TalkSession = {
+    turnId: crypto.randomUUID(),
+    seq: 0,
+    micReady: false,
+    captureStartAt: Date.now(),
+  };
   talkSession = session;
 
   micError.textContent = "";
@@ -388,7 +508,9 @@ async function stopTalking(): Promise<void> {
   }
 
   if (client?.connected) {
-    client.utteranceEnd(session.turnId, session.seq);
+    const captureMs = Math.max(0, Date.now() - session.captureStartAt);
+    utteranceEndAt.set(session.turnId, Date.now());
+    client.utteranceEnd(session.turnId, session.seq, captureMs);
     log(`-> utterance_end (${session.seq} chunks)`, "out");
     setPipelineState("thinking");
   } else {
@@ -421,3 +543,4 @@ talkBtn.addEventListener("pointercancel", (event) => {
 
 setStatus("disconnected");
 setPipelineState("idle");
+latencyUi.clear();
