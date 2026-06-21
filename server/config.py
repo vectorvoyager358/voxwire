@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "info"
+    recordings_dir: str = "recordings"
 
     # --- Provider selection (swap stages without touching code) ---
     asr_provider: str = "deepgram"  # deepgram
