@@ -35,9 +35,7 @@ def _run_turn(ws, turn_id: str) -> list[dict]:
     return _drain_turn(ws)
 
 
-def test_llm_streams_tokens_then_complete(
-    fake_asr: FakeASRProvider, fake_llm: FakeLLMProvider
-) -> None:
+def test_llm_streams_tokens_then_complete(fake_pipeline: None, fake_llm: FakeLLMProvider) -> None:
     with client.websocket_connect("/ws/session/llm-test") as ws:
         messages = _run_turn(ws, "t1")
 

@@ -91,6 +91,27 @@
       .log-in { color: var(--accent); }
       .log-out { color: var(--ok); }
       .log-sys { color: var(--muted); }
+      .convo { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+      .bubble {
+        background: #0b0d12;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      .bubble.assistant { border-color: #2c3a5a; }
+      .bubble .who {
+        display: block;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        margin-bottom: 4px;
+      }
+      .bubble .text { white-space: pre-wrap; }
+      .bubble .text:empty::after { content: "…"; color: var(--muted); }
+      .bubble.you .text.partial { color: var(--muted); font-style: italic; }
     </style>
   </head>
   <body>
@@ -111,6 +132,13 @@
         <button id="talk" class="talk" disabled>Hold to talk</button>
       </div>
       <p id="micError" class="mic-error"></p>
+
+      <div class="convo">
+        <div class="bubble you"><span class="who">You</span><span id="you" class="text"></span></div>
+        <div class="bubble assistant">
+          <span class="who">Voxwire</span><span id="assistant" class="text"></span>
+        </div>
+      </div>
 
       <div id="log"></div>
     </main>
