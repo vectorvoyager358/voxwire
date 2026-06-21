@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from server.config import get_settings
 from server.pipeline.orchestrator import PipelineOrchestrator
 
 logger = logging.getLogger("voxwire.ws")
@@ -26,6 +27,7 @@ async def echo_session(websocket: WebSocket, session_id: str) -> None:
     await websocket.accept()
     logger.info("ws connected session=%s", session_id)
 
+    settings = get_settings()
     send_lock = asyncio.Lock()
 
     async def send(payload: dict) -> None:
@@ -36,7 +38,20 @@ async def echo_session(websocket: WebSocket, session_id: str) -> None:
 
     try:
         while True:
-            message = await websocket.receive_json()
+            try:
+                message = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=settings.ws_idle_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    "ws idle timeout session=%s after %.0fs",
+                    session_id,
+                    settings.ws_idle_timeout_s,
+                )
+                await websocket.close(code=1000, reason="idle timeout")
+                break
+
             msg_type = message.get("type")
 
             if msg_type == "ping":

@@ -48,6 +48,19 @@ class Settings(BaseSettings):
     langfuse_secret_key: str | None = None
     langfuse_host: str | None = None
 
+    # --- Resilience (Phase 3, issue #19) ---
+    asr_timeout_s: float = 15.0
+    llm_timeout_s: float = 30.0
+    llm_ttft_timeout_s: float = 10.0
+    tts_timeout_s: float = 15.0
+    ws_idle_timeout_s: float = 300.0
+    retry_backoff_ms_min: int = 200
+    retry_backoff_ms_max: int = 500
+
+    @property
+    def retry_backoff_ms(self) -> tuple[int, int]:
+        return (self.retry_backoff_ms_min, self.retry_backoff_ms_max)
+
     @property
     def langfuse_tracing_enabled(self) -> bool:
         """True when tracing is explicitly enabled and credentials are present."""
