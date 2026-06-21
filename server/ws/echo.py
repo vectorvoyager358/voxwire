@@ -7,12 +7,15 @@ real pipeline stage (ASR), so this handler now:
 - ``session_start`` -> logged; the declared audio format is remembered.
 - ``audio_chunk``   -> counted (chunks + decoded bytes) **and** streamed to the
   ASR provider, which emits ``transcript_partial`` events live.
-- ``utterance_end`` -> the ASR session is finalized into one ``transcript_final``,
-  then a small ``capture_summary`` is sent, followed by a **mock** TTS reply
-  (``tts_audio_chunk`` events + ``turn_complete``) so the client's playback queue
-  (issue #7) keeps working before real TTS (issue #10) exists.
+- ``utterance_end`` -> the ASR session is finalized into one ``transcript_final``;
+  that text is sent to the LLM, whose reply is streamed back as ``llm_token``
+  events plus a final ``llm_complete`` (issue #9). A small ``capture_summary`` is
+  also sent, followed by a **mock** TTS reply (``tts_audio_chunk`` events +
+  ``turn_complete``) so the client's playback queue (issue #7) keeps working
+  before real TTS (issue #10) exists.
 
-The LLM + real TTS stages (issues #9-#11) will replace the mock reply.
+The real TTS stage (issues #10-#11) will replace the mock reply by synthesizing
+the LLM text instead of a tone.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from server.config import get_settings
 from server.providers.asr import ASRSession, Transcript, get_asr_provider
+from server.providers.llm import get_llm_provider
 
 logger = logging.getLogger("voxwire.ws")
 
@@ -116,10 +120,14 @@ async def echo_session(websocket: WebSocket, session_id: str) -> None:
 
             elif msg_type == "utterance_end":
                 turn_id = message.get("turnId")
+                transcript = ""
                 if asr_session is not None:
-                    await _finalize_asr(asr_session, send, session_id, turn_id)
+                    transcript = await _finalize_asr(asr_session, send, session_id, turn_id)
                     asr_session = None
                     asr_turn_id = None
+                # Generate the spoken reply from the transcript (issue #9).
+                if transcript:
+                    await _run_llm(send, session_id, turn_id, transcript)
                 summary = _finish_turn(stats, message)
                 logger.info("utterance_end session=%s %s", session_id, summary)
                 await send(
@@ -157,6 +165,7 @@ async def echo_session(websocket: WebSocket, session_id: str) -> None:
 def _error_event(
     session_id: str,
     turn_id: str | None,
+    stage: str,
     code: str,
     detail: str,
     *,
@@ -167,7 +176,7 @@ def _error_event(
         "sessionId": session_id,
         "turnId": turn_id,
         "timestamp": _now_iso(),
-        "stage": "asr",
+        "stage": stage,
         "code": code,
         "recoverable": recoverable,
         "message": detail,
@@ -195,7 +204,7 @@ async def _start_asr(send: Send, session_id: str, turn_id: str | None) -> ASRSes
         return await provider.start(on_transcript)
     except Exception as exc:  # noqa: BLE001 - degrade the turn, don't kill the socket
         logger.exception("asr start failed session=%s turn=%s", session_id, turn_id)
-        await send(_error_event(session_id, turn_id, "ASR_UNAVAILABLE", str(exc)))
+        await send(_error_event(session_id, turn_id, "asr", "ASR_UNAVAILABLE", str(exc)))
         return None
 
 
@@ -222,8 +231,9 @@ async def _finalize_asr(
     send: Send,
     session_id: str,
     turn_id: str | None,
-) -> None:
-    """Flush the recognizer and emit exactly one ``transcript_final``."""
+) -> str:
+    """Flush the recognizer, emit one ``transcript_final``, return its text."""
+    text = ""
     try:
         text = await session.finalize()
         await send(
@@ -237,9 +247,58 @@ async def _finalize_asr(
         )
     except Exception as exc:  # noqa: BLE001 - report and still close the turn
         logger.exception("asr finalize failed session=%s turn=%s", session_id, turn_id)
-        await send(_error_event(session_id, turn_id, "ASR_FINALIZE_FAILED", str(exc)))
+        await send(_error_event(session_id, turn_id, "asr", "ASR_FINALIZE_FAILED", str(exc)))
     finally:
         await session.aclose()
+    return text
+
+
+async def _run_llm(send: Send, session_id: str, turn_id: str | None, user_text: str) -> str:
+    """Stream the assistant reply as ``llm_token`` events + one ``llm_complete``.
+
+    Returns the full reply text (also used by the TTS stage). Failures emit a
+    protocol ``error`` (stage ``llm``) but never hang the turn.
+    """
+    try:
+        provider = get_llm_provider(get_settings())
+    except Exception as exc:  # noqa: BLE001 - degrade the turn, don't kill the socket
+        logger.exception("llm start failed session=%s turn=%s", session_id, turn_id)
+        await send(_error_event(session_id, turn_id, "llm", "LLM_UNAVAILABLE", str(exc)))
+        return ""
+
+    parts: list[str] = []
+    index = 0
+    try:
+        async for token in provider.stream(user_text):
+            if not token:
+                continue
+            parts.append(token)
+            await send(
+                {
+                    "type": "llm_token",
+                    "sessionId": session_id,
+                    "turnId": turn_id,
+                    "timestamp": _now_iso(),
+                    "index": index,
+                    "text": token,
+                }
+            )
+            index += 1
+    except Exception as exc:  # noqa: BLE001 - emit what we have, report, keep going
+        logger.exception("llm stream failed session=%s turn=%s", session_id, turn_id)
+        await send(_error_event(session_id, turn_id, "llm", "LLM_STREAM_FAILED", str(exc)))
+
+    full = "".join(parts)
+    await send(
+        {
+            "type": "llm_complete",
+            "sessionId": session_id,
+            "turnId": turn_id,
+            "timestamp": _now_iso(),
+            "text": full,
+        }
+    )
+    return full
 
 
 def _accumulate_chunk(stats: _TurnStats, message: dict) -> None:

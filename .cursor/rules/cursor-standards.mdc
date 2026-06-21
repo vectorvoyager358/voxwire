@@ -1,0 +1,36 @@
+---
+description: Core engineering standards for voxwire — minimal scope, tests, verify-before-done, read-before-write, accurate deps
+alwaysApply: true
+---
+
+# Cursor Standards
+
+Apply on every coding task (implementation, fix, refactor, review) unless the user explicitly asks for a broader change. For the full rationale and checklists, see [.cursor/skills/cursor-standards/SKILL.md](mdc:.cursor/skills/cursor-standards/SKILL.md).
+
+## 1. Minimal scope
+
+Ship the simplest correct diff. Solve only what was asked, match existing conventions, and reuse/extend existing code instead of reimplementing. No "while I'm here" refactors, speculative features, or narrating comments.
+
+## 2. Test coverage
+
+Every new or changed behavior gets a test using the project's existing framework and layout (`pytest` under `tests/`, Vitest/`*.test.ts` for client). Run the suite and make it pass before finishing; add a regression test when fixing a bug.
+
+## 3. Verify before done
+
+After changes, run the project's checks and fix what you broke:
+
+```bash
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check server tests
+.venv/bin/black --check server tests
+```
+
+For client changes, run `npm run build` (and tests if present) in `client/`.
+
+## 4. Read before write
+
+Read the files you will change plus their callers/consumers, and related tests/types/config, before editing. Don't guess at APIs or file layout. When integrating a library, verify its real API rather than relying on memory.
+
+## 5. Dependency versions
+
+Prefer existing dependencies. Before adding or bumping one, look up the current stable release and pin to a specific version or a tight, intentional range matching the project's style (`requirements.txt` + `pyproject.toml`). Remove obsolete constraints; no vague catch-all ranges or dead legacy pins.
