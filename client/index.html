@@ -36,7 +36,37 @@
         padding: 28px;
       }
       h1 { margin: 0 0 4px; font-size: 22px; }
-      .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+      .sub { color: var(--muted); margin: 0 0 16px; font-size: 14px; }
+      .pipeline-state {
+        display: inline-block;
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: #262b36;
+        color: var(--muted);
+        margin-bottom: 16px;
+      }
+      .pipeline-state.listening { background: #3a2020; color: var(--err); }
+      .pipeline-state.thinking { background: #2a2a1a; color: var(--warn); }
+      .pipeline-state.speaking { background: #1a2a3a; color: var(--accent); }
+      .pipeline-state.error { background: #3a2020; color: var(--err); }
+      .banner {
+        display: none;
+        font-size: 13px;
+        line-height: 1.45;
+        padding: 10px 12px;
+        border-radius: 8px;
+        margin-bottom: 14px;
+        border: 1px solid var(--border);
+        background: #1a1d24;
+      }
+      .banner.visible { display: block; }
+      .banner.error { border-color: #5a3030; background: #221818; color: #ffb4b4; }
+      .banner.warn { border-color: #5a5030; background: #221f18; color: var(--warn); }
+      .banner.info { border-color: #30405a; color: var(--accent); }
       .row { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; }
       button {
         background: var(--accent);
@@ -91,7 +121,38 @@
       .log-in { color: var(--accent); }
       .log-out { color: var(--ok); }
       .log-sys { color: var(--muted); }
+      .debug-log { margin-top: 8px; }
+      .debug-log summary {
+        cursor: pointer;
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 8px;
+        user-select: none;
+      }
+      .debug-log #log { height: 140px; }
       .convo { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+      .chat-scroll {
+        max-height: 240px;
+        overflow-y: auto;
+        margin-bottom: 16px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: #0b0d12;
+        padding: 10px;
+      }
+      #chatLog:empty::before {
+        content: "Your transcript and replies appear here.";
+        color: var(--muted);
+        font-size: 13px;
+        display: block;
+      }
+      .turn { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+      .turn:last-child { margin-bottom: 0; }
+      .turn-footnote {
+        font-size: 12px;
+        color: var(--warn);
+        padding-left: 2px;
+      }
       .bubble {
         background: #0b0d12;
         border: 1px solid var(--border);
@@ -117,7 +178,9 @@
   <body>
     <main class="card">
       <h1>voxwire</h1>
-      <p class="sub">Connect, then hold the button and speak. Audio streams to the server.</p>
+      <p class="sub">Connect, hold to talk, and watch your words stream back as speech.</p>
+      <p id="pipelineState" class="pipeline-state" aria-live="polite">Idle</p>
+      <p id="banner" class="banner" role="alert"></p>
 
       <div class="row">
         <button id="connect">Connect</button>
@@ -133,14 +196,12 @@
       </div>
       <p id="micError" class="mic-error"></p>
 
-      <div class="convo">
-        <div class="bubble you"><span class="who">You</span><span id="you" class="text"></span></div>
-        <div class="bubble assistant">
-          <span class="who">Voxwire</span><span id="assistant" class="text"></span>
-        </div>
-      </div>
+      <div id="chatScroll" class="chat-scroll"><div id="chatLog"></div></div>
 
-      <div id="log"></div>
+      <details class="debug-log">
+        <summary>Debug log</summary>
+        <div id="log"></div>
+      </details>
     </main>
 
     <script type="module" src="/src/main.ts"></script>
