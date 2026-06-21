@@ -76,7 +76,11 @@ def test_langfuse_tracing_requires_enabled_flag() -> None:
 
 
 def test_langfuse_tracing_requires_credentials() -> None:
-    settings = Settings(langfuse_enabled=True)
+    settings = Settings(
+        langfuse_enabled=True,
+        langfuse_public_key=None,
+        langfuse_secret_key=None,
+    )
     assert settings.langfuse_tracing_enabled is False
     assert get_turn_tracer(settings).enabled is False
 
@@ -153,4 +157,9 @@ def test_orchestrator_skips_tracing_when_disabled(
         await orch.on_utterance_end({"turnId": "t-off", "totalChunks": 1})
 
     asyncio.run(run())
-    assert TurnTracer(Settings()).enabled is False
+    settings = Settings(
+        langfuse_enabled=False,
+        langfuse_public_key=None,
+        langfuse_secret_key=None,
+    )
+    assert TurnTracer(settings).enabled is False

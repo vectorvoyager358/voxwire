@@ -11,7 +11,7 @@ Turn lifecycle::
                       v       v      v
                    degraded (error emitted, turn still completes)
 
-Stage timeouts (#19) will wrap individual stage calls here later.
+Stage timeouts and bounded transient retry (issue #19).
 """
 
 from __future__ import annotations
@@ -31,10 +31,14 @@ from server.providers.asr import ASRSession, Transcript, get_asr_provider
 from server.providers.llm import get_llm_provider
 from server.providers.tts import TTS_ENCODING, TTS_SAMPLE_RATE, get_tts_provider
 from server.replay.recorder import TurnRecorder
+from server.resilience import StageTimeoutError, run_with_timeout_and_retry, stream_with_retry
 
 logger = logging.getLogger("voxwire.pipeline")
 
 Send = Callable[[dict], Awaitable[None]]
+
+ASR_TIMEOUT_MESSAGE = "ASR provider did not respond in time. Please try again."
+LLM_TIMEOUT_FALLBACK = "Sorry, I'm having trouble responding right now. Please try again."
 
 
 def _now_iso() -> str:
@@ -261,7 +265,12 @@ class PipelineOrchestrator:
 
         try:
             provider = get_asr_provider(self._settings)
-            return await provider.start(on_transcript)
+            return await run_with_timeout_and_retry(
+                lambda: provider.start(on_transcript),
+                stage="asr",
+                timeout_s=self._settings.asr_timeout_s,
+                backoff_ms=self._settings.retry_backoff_ms,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("asr start failed session=%s turn=%s", self._session_id, turn_id)
             await self._emit_error(turn_id, "asr", "ASR_UNAVAILABLE", str(exc))
@@ -285,8 +294,32 @@ class PipelineOrchestrator:
         text = ""
         error: str | None = None
         try:
-            text = await session.finalize()
+            text = await run_with_timeout_and_retry(
+                session.finalize,
+                stage="asr",
+                timeout_s=self._settings.asr_timeout_s,
+                backoff_ms=self._settings.retry_backoff_ms,
+            )
             self._latency.mark("asr_final")
+            await self._emit(
+                {
+                    "type": "transcript_final",
+                    "sessionId": self._session_id,
+                    "turnId": turn_id,
+                    "timestamp": _now_iso(),
+                    "text": text,
+                }
+            )
+        except StageTimeoutError:
+            error = ASR_TIMEOUT_MESSAGE
+            text = ""
+            logger.warning("asr timeout session=%s turn=%s", self._session_id, turn_id)
+            await self._emit_error(
+                turn_id,
+                "asr",
+                "TIMEOUT",
+                f"ASR provider did not respond within {self._settings.asr_timeout_s:.0f}s",
+            )
             await self._emit(
                 {
                     "type": "transcript_final",
@@ -318,7 +351,13 @@ class PipelineOrchestrator:
         error: str | None = None
         try:
             self._latency.mark("llm_start")
-            async for token in provider.stream(user_text):
+            async for token in stream_with_retry(
+                lambda: provider.stream(user_text),
+                stage="llm",
+                timeout_s=self._settings.llm_timeout_s,
+                ttft_timeout_s=self._settings.llm_ttft_timeout_s,
+                backoff_ms=self._settings.retry_backoff_ms,
+            ):
                 if not token:
                     continue
                 self._latency.mark("llm_first_token")
@@ -334,12 +373,28 @@ class PipelineOrchestrator:
                     }
                 )
                 index += 1
+        except StageTimeoutError as exc:
+            error = str(exc)
+            if exc.ttft:
+                detail = (
+                    f"LLM did not produce a first token within "
+                    f"{self._settings.llm_ttft_timeout_s:.0f}s"
+                )
+            else:
+                detail = f"LLM did not finish within {self._settings.llm_timeout_s:.0f}s"
+            logger.warning(
+                "llm timeout session=%s turn=%s partial=%s",
+                self._session_id,
+                turn_id,
+                index,
+            )
+            await self._emit_error(turn_id, "llm", "TIMEOUT", detail)
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
             logger.exception("llm stream failed session=%s turn=%s", self._session_id, turn_id)
             await self._emit_error(turn_id, "llm", "LLM_STREAM_FAILED", error)
 
-        full = "".join(parts)
+        full = "".join(parts) if parts else (LLM_TIMEOUT_FALLBACK if error else "")
         self._latency.mark("llm_complete")
         await self._emit(
             {
@@ -379,7 +434,12 @@ class PipelineOrchestrator:
             if provider is not None:
                 try:
                     self._latency.mark("tts_start")
-                    async for pcm in provider.stream(text):
+                    async for pcm in stream_with_retry(
+                        lambda: provider.stream(text),
+                        stage="tts",
+                        timeout_s=self._settings.tts_timeout_s,
+                        backoff_ms=self._settings.retry_backoff_ms,
+                    ):
                         if not pcm:
                             continue
                         self._latency.mark("tts_first_byte")
@@ -396,6 +456,23 @@ class PipelineOrchestrator:
                             }
                         )
                         seq += 1
+                except StageTimeoutError as exc:
+                    tts_error = str(exc)
+                    logger.warning(
+                        "tts timeout session=%s turn=%s chunks=%s",
+                        self._session_id,
+                        turn_id,
+                        seq,
+                    )
+                    await self._emit_error(
+                        turn_id,
+                        "tts",
+                        "TIMEOUT",
+                        (
+                            f"TTS did not finish within {self._settings.tts_timeout_s:.0f}s; "
+                            "reply shown as text only"
+                        ),
+                    )
                 except Exception as exc:  # noqa: BLE001
                     tts_error = str(exc)
                     logger.exception(
