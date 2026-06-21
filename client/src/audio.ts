@@ -60,7 +60,7 @@ export class AudioCapture {
     this.ctx = new Ctx({ sampleRate: CAPTURE_SAMPLE_RATE });
     if (this.ctx.state === "suspended") await this.ctx.resume();
 
-    await this.ctx.audioWorklet.addModule("/pcm-worklet.js");
+    await this.ctx.audioWorklet.addModule(`${import.meta.env.BASE_URL}pcm-worklet.js`);
 
     this.source = this.ctx.createMediaStreamSource(this.stream);
     this.node = new AudioWorkletNode(this.ctx, "pcm-worklet", {
