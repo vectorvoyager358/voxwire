@@ -1,8 +1,9 @@
 """Shared fakes/fixtures so pipeline tests run without keys or network.
 
 A push-to-talk turn now drives ASR, LLM **and** TTS, so tests stub all three
-provider factories the WebSocket handler uses (``server.ws.echo.get_asr_provider``,
-``server.ws.echo.get_llm_provider`` and ``server.ws.echo.get_tts_provider``).
+provider factories the orchestrator uses (``server.pipeline.orchestrator.get_asr_provider``,
+``server.pipeline.orchestrator.get_llm_provider`` and
+``server.pipeline.orchestrator.get_tts_provider``).
 """
 
 from __future__ import annotations
@@ -42,9 +43,12 @@ class FakeASRProvider(ASRProvider):
     def __init__(self, partial_text: str = "hello", final_text: str = "hello world") -> None:
         self._partial_text = partial_text
         self._final_text = final_text
+        self.last_session: FakeASRSession | None = None
 
     async def start(self, on_transcript: OnTranscript) -> ASRSession:
-        return FakeASRSession(on_transcript, self._partial_text, self._final_text)
+        session = FakeASRSession(on_transcript, self._partial_text, self._final_text)
+        self.last_session = session
+        return session
 
 
 class FakeLLMProvider(LLMProvider):
@@ -76,21 +80,21 @@ class FakeTTSProvider(TTSProvider):
 @pytest.fixture
 def fake_asr(monkeypatch: pytest.MonkeyPatch) -> FakeASRProvider:
     provider = FakeASRProvider()
-    monkeypatch.setattr("server.ws.echo.get_asr_provider", lambda _settings: provider)
+    monkeypatch.setattr("server.pipeline.orchestrator.get_asr_provider", lambda _settings: provider)
     return provider
 
 
 @pytest.fixture
 def fake_llm(monkeypatch: pytest.MonkeyPatch) -> FakeLLMProvider:
     provider = FakeLLMProvider()
-    monkeypatch.setattr("server.ws.echo.get_llm_provider", lambda _settings: provider)
+    monkeypatch.setattr("server.pipeline.orchestrator.get_llm_provider", lambda _settings: provider)
     return provider
 
 
 @pytest.fixture
 def fake_tts(monkeypatch: pytest.MonkeyPatch) -> FakeTTSProvider:
     provider = FakeTTSProvider()
-    monkeypatch.setattr("server.ws.echo.get_tts_provider", lambda _settings: provider)
+    monkeypatch.setattr("server.pipeline.orchestrator.get_tts_provider", lambda _settings: provider)
     return provider
 
 

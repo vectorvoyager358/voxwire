@@ -61,7 +61,7 @@ def test_llm_streams_tokens_then_complete(fake_pipeline: None, fake_llm: FakeLLM
 
 def test_no_llm_when_transcript_empty(monkeypatch, fake_llm: FakeLLMProvider) -> None:
     monkeypatch.setattr(
-        "server.ws.echo.get_asr_provider",
+        "server.pipeline.orchestrator.get_asr_provider",
         lambda _settings: FakeASRProvider(partial_text="", final_text=""),
     )
     with client.websocket_connect("/ws/session/llm-empty") as ws:
