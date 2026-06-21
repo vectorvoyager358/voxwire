@@ -211,6 +211,45 @@ A slice of synthesized audio for playback. Many per turn.
 | `sampleRate` | number | Downstream sample rate (default `24000`). |
 | `data` | string | base64 of raw audio bytes. |
 
+### `latency_report`
+Per-turn latency breakdown. Emitted once per turn, immediately before
+`turn_complete`. Also mirrored in `turn_complete.meta.latency_report`. See
+`docs/latency-budget.md` for field definitions.
+
+```json
+{
+  "type": "latency_report",
+  "sessionId": "8f3c...",
+  "turnId": "a1b2...",
+  "timestamp": 1718766004700,
+  "totalMs": 1200,
+  "bottleneckStage": "llm",
+  "failedStage": null,
+  "stages": {
+    "clientCaptureMs": 850,
+    "audioUploadMs": 40,
+    "asrFinalMs": 420,
+    "llmCompleteMs": 890,
+    "ttsCompleteMs": 280,
+    "orchestrationOverheadMs": 45
+  },
+  "meta": {
+    "totalMs": 1200,
+    "bottleneckStage": "llm",
+    "failedStage": null,
+    "degraded": false
+  }
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `totalMs` | number | Server processing time from `utterance_end` to `turn_complete`. |
+| `stages` | object | Per-stage timings (ms). Unrun stages are `null`. |
+| `bottleneckStage` | string \| null | Slowest server stage: `asr`, `llm`, `tts`, `overhead`, or `upload`. |
+| `failedStage` | string \| null | First failed stage on degraded turns (`asr`, `llm`, `tts`). |
+| `meta` | object | Summary mirror for UI (`totalMs`, `bottleneckStage`, `failedStage`, `degraded`). |
+
 ### `turn_complete`
 Marks the end of a turn (success or degraded). Exactly one per turn, always the
 last message for that `turnId`. Carries a `meta` summary.
@@ -224,15 +263,21 @@ last message for that `turnId`. Carries a `meta` summary.
   "meta": {
     "degraded": false,
     "ttsSkipped": false,
-    "transcriptChars": 24,
-    "replyChars": 32
+    "ttsChunks": 12,
+    "latency": {
+      "totalMs": 1200,
+      "bottleneckStage": "llm",
+      "failedStage": null,
+      "degraded": false
+    },
+    "latency_report": { "...": "full report object" }
   }
 }
 ```
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `meta` | object | Per-turn summary. Phase 2 adds a `latency_report` (see `docs/latency-budget.md`); Phase 3 sets `degraded`/`ttsSkipped`. |
+| `meta` | object | Per-turn summary. Includes `latency` (summary) and `latency_report` (full breakdown). See `docs/latency-budget.md`. |
 
 ### `error`
 A structured failure. May be emitted at any point in a turn; the server still
@@ -285,6 +330,7 @@ sequenceDiagram
   S-->>C: llm_token (index 0..k)
   S-->>C: tts_audio_chunk (seq 0..j)
   S-->>C: llm_complete
+  S-->>C: latency_report
   S-->>C: turn_complete
 ```
 

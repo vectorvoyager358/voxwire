@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from server.config import Settings, get_settings
+from server.latency import LatencyTracker
 from server.providers.asr import ASRSession, Transcript, get_asr_provider
 from server.providers.llm import get_llm_provider
 from server.providers.tts import TTS_ENCODING, TTS_SAMPLE_RATE, get_tts_provider
@@ -103,6 +104,8 @@ class PipelineOrchestrator:
             session_id,
             Path(self._settings.recordings_dir),
         )
+        self._latency = LatencyTracker()
+        self._latency_turn_id: str | None = None
 
     async def _emit(self, payload: dict) -> None:
         """Send a protocol event to the client and append it to the turn trace."""
@@ -111,12 +114,20 @@ class PipelineOrchestrator:
         if turn_id and turn_id == self._recorder._turn_id:
             self._recorder.record_event(payload)
 
+    def _begin_turn_tracking(self, turn_id: str) -> None:
+        if self._latency_turn_id != turn_id:
+            self._latency.begin_turn()
+            self._latency_turn_id = turn_id
+
     async def on_audio_chunk(self, message: dict) -> None:
         """Stream one upstream audio chunk to the ASR provider."""
         self._stats.accumulate_chunk(message)
         turn_id = message.get("turnId")
         if turn_id:
             self._recorder.begin_turn(turn_id)
+            self._begin_turn_tracking(turn_id)
+            self._latency.mark("first_audio_chunk")
+            self._latency.mark("last_audio_chunk")
         if self._asr_session is None or self._asr_turn_id != turn_id:
             if self._asr_session is not None:
                 await self._asr_session.aclose()
@@ -130,6 +141,13 @@ class PipelineOrchestrator:
         """Finalize ASR, run LLM + TTS, emit capture_summary and turn_complete."""
         self._degraded = False
         turn_id = message.get("turnId")
+        if turn_id:
+            self._begin_turn_tracking(turn_id)
+
+        capture_ms = message.get("captureMs")
+        if isinstance(capture_ms, (int, float)) and capture_ms >= 0:
+            self._latency.set_client_capture_ms(int(capture_ms))
+        self._latency.mark("utterance_end")
 
         transcript = ""
         if self._asr_session is not None:
@@ -179,6 +197,7 @@ class PipelineOrchestrator:
         recoverable: bool = True,
     ) -> None:
         self._degraded = True
+        self._latency.set_failed_stage(stage)
         await self._emit(
             {
                 "type": "error",
@@ -196,6 +215,8 @@ class PipelineOrchestrator:
         async def on_transcript(transcript: Transcript) -> None:
             if not transcript.text:
                 return
+            if self._latency.anchor_set:
+                self._latency.mark("asr_first_partial")
             await self._emit(
                 {
                     "type": "transcript_partial",
@@ -220,6 +241,7 @@ class PipelineOrchestrator:
         except (binascii.Error, ValueError):
             return
         self._recorder.append_audio(pcm)
+        self._latency.mark("asr_start")
         try:
             await session.send_audio(pcm)
         except Exception:  # noqa: BLE001
@@ -229,6 +251,7 @@ class PipelineOrchestrator:
         text = ""
         try:
             text = await session.finalize()
+            self._latency.mark("asr_final")
             await self._emit(
                 {
                     "type": "transcript_final",
@@ -256,9 +279,11 @@ class PipelineOrchestrator:
         parts: list[str] = []
         index = 0
         try:
+            self._latency.mark("llm_start")
             async for token in provider.stream(user_text):
                 if not token:
                     continue
+                self._latency.mark("llm_first_token")
                 parts.append(token)
                 await self._emit(
                     {
@@ -276,6 +301,7 @@ class PipelineOrchestrator:
             await self._emit_error(turn_id, "llm", "LLM_STREAM_FAILED", str(exc))
 
         full = "".join(parts)
+        self._latency.mark("llm_complete")
         await self._emit(
             {
                 "type": "llm_complete",
@@ -290,6 +316,7 @@ class PipelineOrchestrator:
     async def _stream_tts(self, turn_id: str | None, text: str) -> dict[str, int | bool]:
         seq = 0
         skipped = not text
+        self._latency.set_tts_skipped(skipped)
 
         if text:
             try:
@@ -301,9 +328,11 @@ class PipelineOrchestrator:
 
             if provider is not None:
                 try:
+                    self._latency.mark("tts_start")
                     async for pcm in provider.stream(text):
                         if not pcm:
                             continue
+                        self._latency.mark("tts_first_byte")
                         await self._emit(
                             {
                                 "type": "tts_audio_chunk",
@@ -322,7 +351,27 @@ class PipelineOrchestrator:
                         "tts stream failed session=%s turn=%s", self._session_id, turn_id
                     )
                     await self._emit_error(turn_id, "tts", "TTS_STREAM_FAILED", str(exc))
+                else:
+                    self._latency.mark("tts_complete")
 
+        self._latency.mark("turn_complete")
+        latency_report = self._latency.build_report(degraded=self._degraded)
+        logger.info(
+            "latency turn=%s total_ms=%s bottleneck=%s failed=%s",
+            turn_id,
+            latency_report["totalMs"],
+            latency_report["bottleneckStage"],
+            latency_report["failedStage"],
+        )
+        await self._emit(
+            {
+                "type": "latency_report",
+                "sessionId": self._session_id,
+                "turnId": turn_id,
+                "timestamp": _now_iso(),
+                **latency_report,
+            }
+        )
         await self._emit(
             {
                 "type": "turn_complete",
@@ -333,7 +382,10 @@ class PipelineOrchestrator:
                     "degraded": self._degraded,
                     "ttsSkipped": skipped,
                     "ttsChunks": seq,
+                    "latency": latency_report["meta"],
+                    "latency_report": latency_report,
                 },
             }
         )
+        self._latency_turn_id = None
         return {"tts_skipped": skipped, "tts_chunks": seq}
