@@ -95,4 +95,5 @@ jobs:
             --session-affinity \
             --min-instances 0 \
             --max-instances 3 \
-            --set-secrets "DEEPGRAM_API_KEY=DEEPGRAM_API_KEY:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest,CARTESIA_API_KEY=CARTESIA_API_KEY:latest"
+            --set-secrets "DEEPGRAM_API_KEY=DEEPGRAM_API_KEY:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest,CARTESIA_API_KEY=CARTESIA_API_KEY:latest,LANGFUSE_PUBLIC_KEY=LANGFUSE_PUBLIC_KEY:latest,LANGFUSE_SECRET_KEY=LANGFUSE_SECRET_KEY:latest" \
+            --set-env-vars "LANGFUSE_ENABLED=true"

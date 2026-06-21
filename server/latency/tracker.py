@@ -124,6 +124,10 @@ class LatencyTracker:
             return None
         return round((self._marks[name] - self._t0) * 1000)
 
+    def ms_since_utterance_end(self, mark: str) -> int | None:
+        """Milliseconds from T₀ (``utterance_end``) to a named mark, if recorded."""
+        return self._ms_since_t0(mark)
+
     def _ms_between(self, start: str, end: str) -> int | None:
         if start not in self._marks or end not in self._marks:
             return None
