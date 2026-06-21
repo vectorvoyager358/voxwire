@@ -22,11 +22,13 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 from server.config import Settings, get_settings
 from server.providers.asr import ASRSession, Transcript, get_asr_provider
 from server.providers.llm import get_llm_provider
 from server.providers.tts import TTS_ENCODING, TTS_SAMPLE_RATE, get_tts_provider
+from server.replay.recorder import TurnRecorder
 
 logger = logging.getLogger("voxwire.pipeline")
 
@@ -97,11 +99,24 @@ class PipelineOrchestrator:
         self._asr_session: ASRSession | None = None
         self._asr_turn_id: str | None = None
         self._degraded = False
+        self._recorder = TurnRecorder(
+            session_id,
+            Path(self._settings.recordings_dir),
+        )
+
+    async def _emit(self, payload: dict) -> None:
+        """Send a protocol event to the client and append it to the turn trace."""
+        await self._send(payload)
+        turn_id = payload.get("turnId")
+        if turn_id and turn_id == self._recorder._turn_id:
+            self._recorder.record_event(payload)
 
     async def on_audio_chunk(self, message: dict) -> None:
         """Stream one upstream audio chunk to the ASR provider."""
         self._stats.accumulate_chunk(message)
         turn_id = message.get("turnId")
+        if turn_id:
+            self._recorder.begin_turn(turn_id)
         if self._asr_session is None or self._asr_turn_id != turn_id:
             if self._asr_session is not None:
                 await self._asr_session.aclose()
@@ -123,12 +138,13 @@ class PipelineOrchestrator:
             self._asr_turn_id = None
 
         reply = ""
+        token_count = 0
         if transcript:
-            reply = await self._run_llm(turn_id, transcript)
+            reply, token_count = await self._run_llm(turn_id, transcript)
 
         summary = self._stats.finish(message)
         logger.info("utterance_end session=%s %s", self._session_id, summary)
-        await self._send(
+        await self._emit(
             {
                 "type": "capture_summary",
                 "sessionId": self._session_id,
@@ -137,7 +153,14 @@ class PipelineOrchestrator:
                 **summary,
             }
         )
-        await self._stream_tts(turn_id, reply)
+        tts_meta = await self._stream_tts(turn_id, reply)
+        self._recorder.persist(
+            transcript=transcript,
+            reply=reply,
+            token_count=token_count,
+            degraded=self._degraded,
+            **tts_meta,
+        )
 
     async def close(self) -> None:
         """Release in-flight provider sessions (e.g. on WebSocket disconnect)."""
@@ -156,7 +179,7 @@ class PipelineOrchestrator:
         recoverable: bool = True,
     ) -> None:
         self._degraded = True
-        await self._send(
+        await self._emit(
             {
                 "type": "error",
                 "sessionId": self._session_id,
@@ -173,7 +196,7 @@ class PipelineOrchestrator:
         async def on_transcript(transcript: Transcript) -> None:
             if not transcript.text:
                 return
-            await self._send(
+            await self._emit(
                 {
                     "type": "transcript_partial",
                     "sessionId": self._session_id,
@@ -196,6 +219,7 @@ class PipelineOrchestrator:
             pcm = base64.b64decode(message.get("data", ""), validate=True)
         except (binascii.Error, ValueError):
             return
+        self._recorder.append_audio(pcm)
         try:
             await session.send_audio(pcm)
         except Exception:  # noqa: BLE001
@@ -205,7 +229,7 @@ class PipelineOrchestrator:
         text = ""
         try:
             text = await session.finalize()
-            await self._send(
+            await self._emit(
                 {
                     "type": "transcript_final",
                     "sessionId": self._session_id,
@@ -221,13 +245,13 @@ class PipelineOrchestrator:
             await session.aclose()
         return text
 
-    async def _run_llm(self, turn_id: str | None, user_text: str) -> str:
+    async def _run_llm(self, turn_id: str | None, user_text: str) -> tuple[str, int]:
         try:
             provider = get_llm_provider(self._settings)
         except Exception as exc:  # noqa: BLE001
             logger.exception("llm start failed session=%s turn=%s", self._session_id, turn_id)
             await self._emit_error(turn_id, "llm", "LLM_UNAVAILABLE", str(exc))
-            return ""
+            return "", 0
 
         parts: list[str] = []
         index = 0
@@ -236,7 +260,7 @@ class PipelineOrchestrator:
                 if not token:
                     continue
                 parts.append(token)
-                await self._send(
+                await self._emit(
                     {
                         "type": "llm_token",
                         "sessionId": self._session_id,
@@ -252,7 +276,7 @@ class PipelineOrchestrator:
             await self._emit_error(turn_id, "llm", "LLM_STREAM_FAILED", str(exc))
 
         full = "".join(parts)
-        await self._send(
+        await self._emit(
             {
                 "type": "llm_complete",
                 "sessionId": self._session_id,
@@ -261,9 +285,9 @@ class PipelineOrchestrator:
                 "text": full,
             }
         )
-        return full
+        return full, index
 
-    async def _stream_tts(self, turn_id: str | None, text: str) -> None:
+    async def _stream_tts(self, turn_id: str | None, text: str) -> dict[str, int | bool]:
         seq = 0
         skipped = not text
 
@@ -280,7 +304,7 @@ class PipelineOrchestrator:
                     async for pcm in provider.stream(text):
                         if not pcm:
                             continue
-                        await self._send(
+                        await self._emit(
                             {
                                 "type": "tts_audio_chunk",
                                 "sessionId": self._session_id,
@@ -299,7 +323,7 @@ class PipelineOrchestrator:
                     )
                     await self._emit_error(turn_id, "tts", "TTS_STREAM_FAILED", str(exc))
 
-        await self._send(
+        await self._emit(
             {
                 "type": "turn_complete",
                 "sessionId": self._session_id,
@@ -312,3 +336,4 @@ class PipelineOrchestrator:
                 },
             }
         )
+        return {"tts_skipped": skipped, "tts_chunks": seq}

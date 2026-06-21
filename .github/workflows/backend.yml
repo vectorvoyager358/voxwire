@@ -1,0 +1,97 @@
+name: Backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "requirements.txt"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/backend.yml"
+  pull_request:
+    paths:
+      - "server/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "requirements.txt"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/backend.yml"
+
+env:
+  REGION: ${{ vars.GCP_REGION }}
+  AR_REPO: voxwire
+  SERVICE: voxwire-api
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Pytest
+        run: python -m pytest -q
+
+      - name: Ruff
+        run: ruff check server tests
+
+      - name: Black
+        run: black --check server tests
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build and push image
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE }}
+        run: |
+          docker build -t "${IMAGE}:${GITHUB_SHA}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:latest"
+
+      - name: Deploy to Cloud Run
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/${{ env.SERVICE }}:${{ github.sha }}
+        run: |
+          gcloud run deploy "${{ env.SERVICE }}" \
+            --project "${PROJECT_ID}" \
+            --region "${{ env.REGION }}" \
+            --image "${IMAGE}" \
+            --platform managed \
+            --allow-unauthenticated \
+            --port 8080 \
+            --timeout 3600 \
+            --session-affinity \
+            --min-instances 0 \
+            --max-instances 3 \
+            --set-secrets "DEEPGRAM_API_KEY=DEEPGRAM_API_KEY:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest,CARTESIA_API_KEY=CARTESIA_API_KEY:latest"
