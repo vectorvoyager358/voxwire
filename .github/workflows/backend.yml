@@ -2,7 +2,7 @@ name: Backend
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "server/**"
       - "tests/**"
@@ -50,7 +50,7 @@ jobs:
         run: black --check server tests
 
   deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: test
     runs-on: ubuntu-latest
     permissions:
