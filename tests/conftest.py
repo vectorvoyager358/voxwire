@@ -1,8 +1,8 @@
 """Shared fakes/fixtures so pipeline tests run without keys or network.
 
-A push-to-talk turn now drives ASR **and** the LLM, so tests stub both provider
-factories the WebSocket handler uses (``server.ws.echo.get_asr_provider`` and
-``server.ws.echo.get_llm_provider``).
+A push-to-talk turn now drives ASR, LLM **and** TTS, so tests stub all three
+provider factories the WebSocket handler uses (``server.ws.echo.get_asr_provider``,
+``server.ws.echo.get_llm_provider`` and ``server.ws.echo.get_tts_provider``).
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import pytest
 
 from server.providers.asr import ASRProvider, ASRSession, OnTranscript, Transcript
 from server.providers.llm import LLMProvider
+from server.providers.tts import TTSProvider
 
 
 class FakeASRSession(ASRSession):
@@ -59,6 +60,19 @@ class FakeLLMProvider(LLMProvider):
             yield token
 
 
+class FakeTTSProvider(TTSProvider):
+    """Streams a scripted list of raw PCM byte chunks and records the text."""
+
+    def __init__(self, chunks: list[bytes] | None = None) -> None:
+        self.chunks = chunks if chunks is not None else [b"\x01\x02\x03\x04", b"\x05\x06"]
+        self.received: list[str] = []
+
+    async def stream(self, text: str) -> AsyncIterator[bytes]:
+        self.received.append(text)
+        for chunk in self.chunks:
+            yield chunk
+
+
 @pytest.fixture
 def fake_asr(monkeypatch: pytest.MonkeyPatch) -> FakeASRProvider:
     provider = FakeASRProvider()
@@ -74,6 +88,15 @@ def fake_llm(monkeypatch: pytest.MonkeyPatch) -> FakeLLMProvider:
 
 
 @pytest.fixture
-def fake_pipeline(fake_asr: FakeASRProvider, fake_llm: FakeLLMProvider) -> None:
-    """Stub both ASR and LLM so a full turn needs no keys/network."""
+def fake_tts(monkeypatch: pytest.MonkeyPatch) -> FakeTTSProvider:
+    provider = FakeTTSProvider()
+    monkeypatch.setattr("server.ws.echo.get_tts_provider", lambda _settings: provider)
+    return provider
+
+
+@pytest.fixture
+def fake_pipeline(
+    fake_asr: FakeASRProvider, fake_llm: FakeLLMProvider, fake_tts: FakeTTSProvider
+) -> None:
+    """Stub ASR, LLM and TTS so a full turn needs no keys/network."""
     return None

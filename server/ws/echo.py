@@ -9,13 +9,13 @@ real pipeline stage (ASR), so this handler now:
   ASR provider, which emits ``transcript_partial`` events live.
 - ``utterance_end`` -> the ASR session is finalized into one ``transcript_final``;
   that text is sent to the LLM, whose reply is streamed back as ``llm_token``
-  events plus a final ``llm_complete`` (issue #9). A small ``capture_summary`` is
-  also sent, followed by a **mock** TTS reply (``tts_audio_chunk`` events +
-  ``turn_complete``) so the client's playback queue (issue #7) keeps working
-  before real TTS (issue #10) exists.
+  events plus a final ``llm_complete`` (issue #9). The reply text is then
+  synthesized by the TTS provider and streamed back as ``tts_audio_chunk`` events
+  (issue #10), and the turn ends with ``turn_complete``. A small
+  ``capture_summary`` is also sent for diagnostics.
 
-The real TTS stage (issues #10-#11) will replace the mock reply by synthesizing
-the LLM text instead of a tone.
+This completes the streaming ASR -> LLM -> TTS pipeline (issue #11 adds the
+full end-to-end orchestration/latency work).
 """
 
 from __future__ import annotations
@@ -24,8 +24,6 @@ import asyncio
 import base64
 import binascii
 import logging
-import math
-import struct
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -35,15 +33,12 @@ from fastapi import WebSocket, WebSocketDisconnect
 from server.config import get_settings
 from server.providers.asr import ASRSession, Transcript, get_asr_provider
 from server.providers.llm import get_llm_provider
+from server.providers.tts import TTS_ENCODING, TTS_SAMPLE_RATE, get_tts_provider
 
 logger = logging.getLogger("voxwire.ws")
 
 # Sends one JSON envelope to the client (serialized via the session's lock).
 Send = Callable[[dict], Awaitable[None]]
-
-# Mock TTS downstream format (matches docs/event-protocol.md: 24 kHz mono PCM16).
-TTS_SAMPLE_RATE = 24000
-_TTS_CHUNK_MS = 120
 
 
 def _now_iso() -> str:
@@ -126,8 +121,9 @@ async def echo_session(websocket: WebSocket, session_id: str) -> None:
                     asr_session = None
                     asr_turn_id = None
                 # Generate the spoken reply from the transcript (issue #9).
+                reply = ""
                 if transcript:
-                    await _run_llm(send, session_id, turn_id, transcript)
+                    reply = await _run_llm(send, session_id, turn_id, transcript)
                 summary = _finish_turn(stats, message)
                 logger.info("utterance_end session=%s %s", session_id, summary)
                 await send(
@@ -139,8 +135,8 @@ async def echo_session(websocket: WebSocket, session_id: str) -> None:
                         **summary,
                     }
                 )
-                # Stand-in for the real TTS stage so issue #7 playback is testable.
-                await _stream_mock_tts(send, session_id, summary["turnId"])
+                # Synthesize the reply and stream it back, then end the turn (issue #10).
+                await _stream_tts(send, session_id, turn_id, reply)
 
             else:
                 # Unknown / Phase 0 messages: echo back for visibility.
@@ -334,49 +330,48 @@ def _finish_turn(stats: _TurnStats, message: dict) -> dict:
     return summary
 
 
-def _make_tone() -> list[int]:
-    """A short, continuous-phase five-note arpeggio as PCM16 samples.
+async def _stream_tts(send: Send, session_id: str, turn_id: str | None, text: str) -> None:
+    """Synthesize ``text`` and stream it as ``tts_audio_chunk`` + ``turn_complete``.
 
-    Phase carries across note boundaries so there are no clicks within the
-    reply; any gap or overlap the client introduces between chunks would
-    therefore be audible — exactly what issue #7 needs to verify.
+    Always ends the turn with exactly one ``turn_complete``. An empty reply is
+    skipped (no audio); a missing key / TTS error emits a protocol ``error``
+    (stage ``tts``) and ends the turn degraded rather than hanging the socket.
     """
-    notes = (440, 554, 659, 554, 440)  # A4, C#5, E5, C#5, A4
-    note_samples = TTS_SAMPLE_RATE // 2  # 0.5 s per note
-    amplitude = 0.25
-    samples: list[int] = []
-    phase = 0.0
-    for freq in notes:
-        step = 2 * math.pi * freq / TTS_SAMPLE_RATE
-        for _ in range(note_samples):
-            samples.append(int(amplitude * 32767 * math.sin(phase)))
-            phase += step
-    return samples
-
-
-async def _stream_mock_tts(send: Send, session_id: str, turn_id: str | None) -> None:
-    """Stream a mock TTS reply as ``tts_audio_chunk`` events + ``turn_complete``."""
-    tone = _make_tone()
-    samples_per_chunk = TTS_SAMPLE_RATE * _TTS_CHUNK_MS // 1000
     seq = 0
-    for start in range(0, len(tone), samples_per_chunk):
-        block = tone[start : start + samples_per_chunk]
-        raw = struct.pack(f"<{len(block)}h", *block)
-        await send(
-            {
-                "type": "tts_audio_chunk",
-                "sessionId": session_id,
-                "turnId": turn_id,
-                "timestamp": _now_iso(),
-                "seq": seq,
-                "encoding": "pcm_s16le",
-                "sampleRate": TTS_SAMPLE_RATE,
-                "data": base64.b64encode(raw).decode(),
-            }
-        )
-        seq += 1
-        # Stream faster than real time so the client's queue stays ahead.
-        await asyncio.sleep(_TTS_CHUNK_MS / 1000 / 2)
+    degraded = False
+    skipped = not text
+
+    if text:
+        try:
+            provider = get_tts_provider(get_settings())
+        except Exception as exc:  # noqa: BLE001 - degrade the turn, don't kill the socket
+            logger.exception("tts start failed session=%s turn=%s", session_id, turn_id)
+            await send(_error_event(session_id, turn_id, "tts", "TTS_UNAVAILABLE", str(exc)))
+            provider = None
+            degraded = True
+
+        if provider is not None:
+            try:
+                async for pcm in provider.stream(text):
+                    if not pcm:
+                        continue
+                    await send(
+                        {
+                            "type": "tts_audio_chunk",
+                            "sessionId": session_id,
+                            "turnId": turn_id,
+                            "timestamp": _now_iso(),
+                            "seq": seq,
+                            "encoding": TTS_ENCODING,
+                            "sampleRate": TTS_SAMPLE_RATE,
+                            "data": base64.b64encode(pcm).decode(),
+                        }
+                    )
+                    seq += 1
+            except Exception as exc:  # noqa: BLE001 - report and still close the turn
+                logger.exception("tts stream failed session=%s turn=%s", session_id, turn_id)
+                await send(_error_event(session_id, turn_id, "tts", "TTS_STREAM_FAILED", str(exc)))
+                degraded = True
 
     await send(
         {
@@ -384,6 +379,6 @@ async def _stream_mock_tts(send: Send, session_id: str, turn_id: str | None) -> 
             "sessionId": session_id,
             "turnId": turn_id,
             "timestamp": _now_iso(),
-            "meta": {"degraded": False, "ttsSkipped": False, "mock": True, "ttsChunks": seq},
+            "meta": {"degraded": degraded, "ttsSkipped": skipped, "ttsChunks": seq},
         }
     )

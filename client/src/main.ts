@@ -16,6 +16,8 @@ const micError = document.getElementById("micError") as HTMLParagraphElement;
 const dot = document.getElementById("dot") as HTMLSpanElement;
 const statusText = document.getElementById("statusText") as HTMLSpanElement;
 const logEl = document.getElementById("log") as HTMLDivElement;
+const youEl = document.getElementById("you") as HTMLSpanElement;
+const assistantEl = document.getElementById("assistant") as HTMLSpanElement;
 
 function log(text: string, kind: "in" | "out" | "sys" = "sys"): void {
   const line = document.createElement("div");
@@ -46,11 +48,62 @@ interface ServerMessage {
   seq?: number;
   data?: string;
   sampleRate?: number;
+  text?: string;
+  stage?: string;
+  message?: string;
+}
+
+// Conversation display: the user's transcript and the assistant's streamed reply.
+let displayTurn: string | null = null;
+let assistantText = "";
+
+function clearConvo(): void {
+  displayTurn = null;
+  assistantText = "";
+  youEl.textContent = "";
+  youEl.classList.remove("partial");
+  assistantEl.textContent = "";
+}
+
+// Reset both bubbles when a new turn's first message arrives.
+function syncTurn(turnId?: string): void {
+  if (turnId && turnId !== displayTurn) {
+    displayTurn = turnId;
+    assistantText = "";
+    youEl.textContent = "";
+    youEl.classList.remove("partial");
+    assistantEl.textContent = "";
+  }
+}
+
+function setYou(text: string, final: boolean): void {
+  youEl.textContent = text;
+  youEl.classList.toggle("partial", !final);
 }
 
 function handleMessage(data: unknown): void {
   const msg = data as ServerMessage;
   switch (msg?.type) {
+    case "transcript_partial":
+      syncTurn(msg.turnId);
+      setYou(msg.text ?? "", false);
+      return;
+    case "transcript_final":
+      syncTurn(msg.turnId);
+      setYou(msg.text ?? "", true);
+      log(`<- transcript_final: ${msg.text ?? ""}`, "in");
+      return;
+    case "llm_token":
+      syncTurn(msg.turnId);
+      assistantText += msg.text ?? "";
+      assistantEl.textContent = assistantText;
+      return;
+    case "llm_complete":
+      syncTurn(msg.turnId);
+      assistantText = msg.text ?? assistantText;
+      assistantEl.textContent = assistantText;
+      log("<- llm_complete", "in");
+      return;
     case "tts_audio_chunk":
       if (typeof msg.turnId === "string" && typeof msg.data === "string") {
         player.enqueue(msg.turnId, msg.seq ?? 0, msg.data, msg.sampleRate);
@@ -59,6 +112,9 @@ function handleMessage(data: unknown): void {
       return;
     case "turn_complete":
       log(`<- turn_complete (turn ${msg.turnId})`, "in");
+      return;
+    case "error":
+      log(`<- error [${msg.stage ?? "?"}] ${msg.message ?? ""}`, "sys");
       return;
     default:
       log(`<- ${JSON.stringify(data)}`, "in");
@@ -74,6 +130,7 @@ connectBtn.addEventListener("click", () => {
   if (client) {
     void stopTalking();
     player.reset();
+    clearConvo();
     client.disconnect();
     client = null;
     return;
