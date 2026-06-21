@@ -43,9 +43,15 @@ class Settings(BaseSettings):
     cartesia_api_key: str | None = None
 
     # --- Observability (Phase 2, optional) ---
+    langfuse_enabled: bool = False
     langfuse_public_key: str | None = None
     langfuse_secret_key: str | None = None
     langfuse_host: str | None = None
+
+    @property
+    def langfuse_tracing_enabled(self) -> bool:
+        """True when tracing is explicitly enabled and credentials are present."""
+        return bool(self.langfuse_enabled and self.langfuse_public_key and self.langfuse_secret_key)
 
     # Maps a logical credential name to the attribute that holds it.
     _KEY_ATTRS = {
