@@ -1,6 +1,7 @@
 name: Backend
 
 on:
+  workflow_dispatch:
   push:
     branches: [master]
     paths:
@@ -50,7 +51,7 @@ jobs:
         run: black --check server tests
 
   deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
     needs: test
     runs-on: ubuntu-latest
     permissions:
