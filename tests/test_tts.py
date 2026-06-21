@@ -65,7 +65,7 @@ def test_tts_streams_audio_chunks_then_complete(
 def test_no_tts_when_no_reply(monkeypatch, fake_pipeline: None, fake_tts: FakeTTSProvider) -> None:
     # Empty transcript -> no LLM, no reply -> TTS skipped, turn still completes.
     monkeypatch.setattr(
-        "server.ws.echo.get_asr_provider",
+        "server.pipeline.orchestrator.get_asr_provider",
         lambda _settings: FakeASRProvider(partial_text="", final_text=""),
     )
     with client.websocket_connect("/ws/session/tts-empty") as ws:
