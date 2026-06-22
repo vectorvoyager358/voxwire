@@ -50,7 +50,7 @@ def test_orchestrator_degraded_on_llm_failure(
     fake_tts: FakeTTSProvider,
 ) -> None:
     def _raise(_settings):
-        raise RuntimeError("no gemini key")
+        raise RuntimeError("Missing required provider credentials:\n  gemini -> set GEMINI_API_KEY")
 
     monkeypatch.setattr("server.pipeline.orchestrator.get_llm_provider", _raise)
 
@@ -65,6 +65,8 @@ def test_orchestrator_degraded_on_llm_failure(
     errors = [e for e in events if e["type"] == "error"]
     complete = events[-1]
     assert errors and errors[0]["stage"] == "llm"
+    assert errors[0]["code"] == "CONFIG_ERROR"
+    assert errors[0]["recoverable"] is False
     assert complete["type"] == "turn_complete"
     assert complete["meta"]["degraded"] is True
     assert fake_tts.received == []

@@ -74,6 +74,9 @@ async def echo_session(websocket: WebSocket, session_id: str) -> None:
             elif msg_type == "utterance_end":
                 await pipeline.on_utterance_end(message)
 
+            elif msg_type == "text_turn":
+                await pipeline.on_text_turn(message)
+
             else:
                 await send(
                     {

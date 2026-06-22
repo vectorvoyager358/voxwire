@@ -20,7 +20,14 @@ const logEl = document.getElementById("log") as HTMLDivElement;
 const chatLog = document.getElementById("chatLog") as HTMLDivElement;
 const chatScroll = document.getElementById("chatScroll") as HTMLDivElement;
 const pipelineStateEl = document.getElementById("pipelineState") as HTMLParagraphElement;
-const bannerEl = document.getElementById("banner") as HTMLParagraphElement;
+const bannerEl = document.getElementById("banner") as HTMLDivElement;
+const bannerStageEl = document.getElementById("bannerStage") as HTMLParagraphElement;
+const bannerMessageEl = document.getElementById("bannerMessage") as HTMLParagraphElement;
+const bannerActionsEl = document.getElementById("bannerActions") as HTMLDivElement;
+const bannerRetryBtn = document.getElementById("bannerRetry") as HTMLButtonElement;
+const textFallbackEl = document.getElementById("textFallback") as HTMLDivElement;
+const textFallbackInput = document.getElementById("textFallbackInput") as HTMLInputElement;
+const textFallbackSend = document.getElementById("textFallbackSend") as HTMLButtonElement;
 const latencyStats = document.getElementById("latencyStats") as HTMLDivElement;
 const latencyWaterfall = document.getElementById("latencyWaterfall") as HTMLDivElement;
 const latencyTableBody = document.getElementById("latencyTableBody") as HTMLTableSectionElement;
@@ -48,6 +55,7 @@ interface ServerMessage {
   sampleRate?: number;
   text?: string;
   stage?: string;
+  code?: string;
   message?: string;
   recoverable?: boolean;
   meta?: TurnCompleteMeta | LatencySummaryMeta;
@@ -93,13 +101,11 @@ function setPipelineState(state: PipelineState): void {
 }
 
 function showBanner(text: string, kind: "error" | "warn" | "info" = "warn"): void {
-  bannerEl.textContent = text;
+  bannerStageEl.hidden = true;
+  bannerMessageEl.textContent = text;
+  bannerActionsEl.hidden = true;
   bannerEl.className = `banner visible ${kind}`;
-}
-
-function hideBanner(): void {
-  bannerEl.textContent = "";
-  bannerEl.className = "banner";
+  setTextFallbackVisible(false);
 }
 
 function setTalkEnabled(enabled: boolean): void {
@@ -133,6 +139,60 @@ const player = new TtsPlayer((info) => {
 
 let activeTurn: ActiveTurn | null = null;
 let pttBlocked = false;
+let showTextFallback = false;
+let lastRecoverableError: { stage: string; message: string } | null = null;
+
+const STAGE_LABELS: Record<string, string> = {
+  asr: "Speech recognition",
+  llm: "Assistant",
+  tts: "Audio",
+  orchestrator: "Pipeline",
+  transport: "Connection",
+};
+
+function stageLabel(stage: string): string {
+  return STAGE_LABELS[stage] ?? stage;
+}
+
+function hideBanner(): void {
+  bannerStageEl.hidden = true;
+  bannerMessageEl.textContent = "";
+  bannerActionsEl.hidden = true;
+  bannerEl.className = "banner";
+  lastRecoverableError = null;
+}
+
+function showErrorBanner(
+  stage: string,
+  message: string,
+  options: { recoverable?: boolean; kind?: "error" | "warn" | "info"; showRetry?: boolean } = {},
+): void {
+  const recoverable = options.recoverable ?? true;
+  const kind = options.kind ?? (recoverable ? "warn" : "error");
+  bannerStageEl.textContent = stageLabel(stage);
+  bannerStageEl.hidden = false;
+  bannerMessageEl.textContent = message;
+  bannerEl.className = `banner visible ${kind}`;
+
+  const showRetry = options.showRetry ?? recoverable;
+  bannerActionsEl.hidden = !showRetry;
+  bannerRetryBtn.hidden = !showRetry;
+
+  if (recoverable) {
+    lastRecoverableError = { stage, message };
+  } else {
+    lastRecoverableError = null;
+  }
+
+  showTextFallback = recoverable && stage === "asr";
+  textFallbackEl.classList.toggle("visible", showTextFallback);
+}
+
+function setTextFallbackVisible(visible: boolean): void {
+  showTextFallback = visible;
+  textFallbackEl.classList.toggle("visible", visible);
+  if (!visible) textFallbackInput.value = "";
+}
 
 function scrollChatToBottom(): void {
   chatScroll.scrollTop = chatScroll.scrollHeight;
@@ -263,13 +323,20 @@ function setAssistantComplete(text: string): void {
 
 function finishTurn(meta?: TurnCompleteMeta): void {
   if (!activeTurn) return;
-  const notes: string[] = [];
-  if (meta?.degraded) notes.push("Turn completed with errors");
-  if (meta?.ttsSkipped) notes.push("Reply shown as text only (audio skipped)");
-  if (notes.length) {
-    activeTurn.footnote.textContent = notes.join(" · ");
-    activeTurn.footnote.hidden = false;
+  activeTurn.footnote.replaceChildren();
+  if (meta?.degraded) {
+    const badge = document.createElement("span");
+    badge.className = "turn-badge degraded";
+    badge.textContent = "Degraded turn";
+    activeTurn.footnote.appendChild(badge);
   }
+  if (meta?.ttsSkipped) {
+    const badge = document.createElement("span");
+    badge.className = "turn-badge tts-skipped";
+    badge.textContent = "Text only — no audio";
+    activeTurn.footnote.appendChild(badge);
+  }
+  activeTurn.footnote.hidden = activeTurn.footnote.childElementCount === 0;
   activeTurn = null;
   scrollChatToBottom();
 }
@@ -282,6 +349,7 @@ function clearChat(): void {
 function resetSessionUi(): void {
   clearChat();
   hideBanner();
+  setTextFallbackVisible(false);
   pttBlocked = false;
   utteranceEndAt.clear();
   feltLatencyMs.clear();
@@ -309,7 +377,7 @@ function handleMessage(data: unknown): void {
       if (msg.turnId) ensureTurn(msg.turnId);
       setYou(msg.text ?? "", true);
       log(`<- transcript_final: ${msg.text ?? ""}`, "in");
-      if (!(msg.text ?? "").trim()) {
+      if (!(msg.text ?? "").trim() && !lastRecoverableError) {
         showBanner("No speech detected — hold the button longer and speak clearly.", "warn");
       }
       return;
@@ -347,27 +415,37 @@ function handleMessage(data: unknown): void {
     }
     case "turn_complete": {
       finishTurn(msg.meta);
-      if (msg.meta?.degraded) {
-        showBanner("Something went wrong during this turn. Check the reply above.", "warn");
+      if (msg.meta?.degraded && lastRecoverableError) {
+        showErrorBanner(lastRecoverableError.stage, lastRecoverableError.message, {
+          recoverable: true,
+          kind: "warn",
+          showRetry: true,
+        });
+        setPipelineState("error");
+      } else if (msg.meta?.degraded) {
+        showBanner("Turn completed with errors.", "warn");
         setPipelineState("error");
       } else {
         hideBanner();
+        setTextFallbackVisible(false);
         setPipelineState("idle");
       }
       log(`<- turn_complete (turn ${msg.turnId})`, "in");
       return;
     }
     case "error": {
-      const stage = msg.stage ?? "unknown";
+      const stage = msg.stage ?? "orchestrator";
       const detail = msg.message ?? "An error occurred.";
-      log(`<- error [${stage}] ${detail}`, "sys");
+      const recoverable = msg.recoverable !== false;
+      log(`<- error [${stage}] ${msg.code ?? "?"} ${detail}`, "sys");
       setPipelineState("error");
-      if (msg.recoverable === false) {
+      if (!recoverable) {
         pttBlocked = true;
         setTalkEnabled(false);
-        showBanner(`${detail} Push-to-talk is disabled until you reconnect.`, "error");
+        setTextFallbackVisible(false);
+        showErrorBanner(stage, detail, { recoverable: false, kind: "error", showRetry: false });
       } else {
-        showBanner(`${detail} Try again by holding the talk button.`, "warn");
+        showErrorBanner(stage, detail, { recoverable: true, kind: "warn", showRetry: true });
       }
       return;
     }
@@ -438,6 +516,9 @@ pingBtn.addEventListener("click", () => {
 async function startTalking(): Promise<void> {
   if (!client?.connected || pttBlocked || talkSession) return;
 
+  hideBanner();
+  setTextFallbackVisible(false);
+
   const session: TalkSession = {
     turnId: crypto.randomUUID(),
     seq: 0,
@@ -447,7 +528,6 @@ async function startTalking(): Promise<void> {
   talkSession = session;
 
   micError.textContent = "";
-  hideBanner();
   ensureTurn(session.turnId);
   talkBtn.classList.add("recording");
   talkBtn.textContent = "Starting mic…";
@@ -539,6 +619,32 @@ talkBtn.addEventListener("pointercancel", (event) => {
     talkBtn.releasePointerCapture(event.pointerId);
   }
   void stopTalking();
+});
+
+bannerRetryBtn.addEventListener("click", () => {
+  hideBanner();
+  setPipelineState("idle");
+  talkBtn.focus();
+});
+
+async function sendTextFallback(): Promise<void> {
+  if (!client?.connected || pttBlocked) return;
+  const text = textFallbackInput.value.trim();
+  if (!text) return;
+
+  const turnId = crypto.randomUUID();
+  hideBanner();
+  setTextFallbackVisible(false);
+  ensureTurn(turnId);
+  setYou(text, true);
+  setPipelineState("thinking");
+  client.textTurn(turnId, text);
+  log(`-> text_turn (${text.slice(0, 40)}…)`, "out");
+}
+
+textFallbackSend.addEventListener("click", () => void sendTextFallback());
+textFallbackInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") void sendTextFallback();
 });
 
 setStatus("disconnected");

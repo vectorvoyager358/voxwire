@@ -27,6 +27,18 @@ from pathlib import Path
 from server.config import Settings, get_settings
 from server.latency import LatencyTracker
 from server.observability import TurnTrace, get_turn_tracer
+from server.pipeline.errors import (
+    BAD_REQUEST,
+    MSG_ASR_DOWN,
+    MSG_LLM_TIMEOUT,
+    MSG_PARTIAL_LLM,
+    MSG_TTS_DOWN,
+    PROVIDER_DOWN,
+    STREAM_FAILED,
+    TIMEOUT,
+    classify_provider_error,
+    is_recoverable,
+)
 from server.providers.asr import ASRSession, Transcript, get_asr_provider
 from server.providers.llm import get_llm_provider
 from server.providers.tts import TTS_ENCODING, TTS_SAMPLE_RATE, get_tts_provider
@@ -37,7 +49,6 @@ logger = logging.getLogger("voxwire.pipeline")
 
 Send = Callable[[dict], Awaitable[None]]
 
-ASR_TIMEOUT_MESSAGE = "ASR provider did not respond in time. Please try again."
 LLM_TIMEOUT_FALLBACK = "Sorry, I'm having trouble responding right now. Please try again."
 
 
@@ -179,9 +190,10 @@ class PipelineOrchestrator:
         reply = ""
         token_count = 0
         llm_error: str | None = None
+        skip_tts = False
         if transcript:
             trace.begin_llm(transcript)
-            reply, token_count, llm_error = await self._run_llm(turn_id, transcript)
+            reply, token_count, llm_error, skip_tts = await self._run_llm(turn_id, transcript)
             trace.end_llm(
                 reply,
                 token_count=token_count,
@@ -207,9 +219,96 @@ class PipelineOrchestrator:
             trace,
             transcript=transcript,
             token_count=token_count,
+            force_skip_tts=skip_tts,
         )
         self._recorder.persist(
             transcript=transcript,
+            reply=reply,
+            token_count=token_count,
+            degraded=self._degraded,
+            **tts_meta,
+        )
+
+    async def on_text_turn(self, message: dict) -> None:
+        """Run LLM + TTS for typed input when ASR is unavailable (issue #20)."""
+        self._degraded = False
+        turn_id = message.get("turnId")
+        text = str(message.get("text") or "").strip()
+        if not turn_id:
+            return
+
+        self._recorder.begin_turn(turn_id)
+        self._begin_turn_tracking(turn_id)
+        self._latency.mark("utterance_end")
+
+        trace = self._tracer.begin_turn(self._session_id, turn_id)
+        self._turn_trace = trace
+        trace.begin_asr()
+        trace.end_asr(text, latency_ms=0)
+
+        if not text:
+            await self._emit_error(turn_id, "asr", BAD_REQUEST, "Message text is required.")
+            await self._emit(
+                {
+                    "type": "transcript_final",
+                    "sessionId": self._session_id,
+                    "turnId": turn_id,
+                    "timestamp": _now_iso(),
+                    "text": "",
+                }
+            )
+        else:
+            await self._emit(
+                {
+                    "type": "transcript_final",
+                    "sessionId": self._session_id,
+                    "turnId": turn_id,
+                    "timestamp": _now_iso(),
+                    "text": text,
+                }
+            )
+
+        reply = ""
+        token_count = 0
+        skip_tts = False
+        if text:
+            trace.begin_llm(text)
+            reply, token_count, llm_error, skip_tts = await self._run_llm(turn_id, text)
+            trace.end_llm(
+                reply,
+                token_count=token_count,
+                error=llm_error,
+                ttft_ms=self._latency.ms_since_utterance_end("llm_first_token"),
+                complete_ms=self._latency.ms_since_utterance_end("llm_complete"),
+            )
+
+        summary = {
+            "turnId": turn_id,
+            "received": 0,
+            "declared": 0,
+            "bytes": 0,
+            "clean": True,
+            "typed": True,
+        }
+        await self._emit(
+            {
+                "type": "capture_summary",
+                "sessionId": self._session_id,
+                "turnId": turn_id,
+                "timestamp": _now_iso(),
+                **summary,
+            }
+        )
+        tts_meta = await self._stream_tts(
+            turn_id,
+            reply,
+            trace,
+            transcript=text,
+            token_count=token_count,
+            force_skip_tts=skip_tts,
+        )
+        self._recorder.persist(
+            transcript=text,
             reply=reply,
             token_count=token_count,
             degraded=self._degraded,
@@ -230,10 +329,12 @@ class PipelineOrchestrator:
         code: str,
         detail: str,
         *,
-        recoverable: bool = True,
+        recoverable: bool | None = None,
     ) -> None:
         self._degraded = True
         self._latency.set_failed_stage(stage)
+        if recoverable is None:
+            recoverable = is_recoverable(code)
         await self._emit(
             {
                 "type": "error",
@@ -273,7 +374,10 @@ class PipelineOrchestrator:
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("asr start failed session=%s turn=%s", self._session_id, turn_id)
-            await self._emit_error(turn_id, "asr", "ASR_UNAVAILABLE", str(exc))
+            code, message = classify_provider_error(exc)
+            if code == PROVIDER_DOWN:
+                message = MSG_ASR_DOWN
+            await self._emit_error(turn_id, "asr", code, message)
             return None
 
     async def _forward_audio(self, session: ASRSession, turn_id: str | None, message: dict) -> None:
@@ -311,15 +415,10 @@ class PipelineOrchestrator:
                 }
             )
         except StageTimeoutError:
-            error = ASR_TIMEOUT_MESSAGE
+            error = MSG_ASR_DOWN
             text = ""
             logger.warning("asr timeout session=%s turn=%s", self._session_id, turn_id)
-            await self._emit_error(
-                turn_id,
-                "asr",
-                "TIMEOUT",
-                f"ASR provider did not respond within {self._settings.asr_timeout_s:.0f}s",
-            )
+            await self._emit_error(turn_id, "asr", TIMEOUT, MSG_ASR_DOWN)
             await self._emit(
                 {
                     "type": "transcript_final",
@@ -332,23 +431,30 @@ class PipelineOrchestrator:
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
             logger.exception("asr finalize failed session=%s turn=%s", self._session_id, turn_id)
-            await self._emit_error(turn_id, "asr", "ASR_FINALIZE_FAILED", error)
+            code, message = classify_provider_error(exc)
+            if code == PROVIDER_DOWN:
+                message = MSG_ASR_DOWN
+            await self._emit_error(turn_id, "asr", code, message)
         finally:
             await session.aclose()
         return text, error
 
-    async def _run_llm(self, turn_id: str | None, user_text: str) -> tuple[str, int, str | None]:
+    async def _run_llm(
+        self, turn_id: str | None, user_text: str
+    ) -> tuple[str, int, str | None, bool]:
         try:
             provider = get_llm_provider(self._settings)
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
             logger.exception("llm start failed session=%s turn=%s", self._session_id, turn_id)
-            await self._emit_error(turn_id, "llm", "LLM_UNAVAILABLE", error)
-            return "", 0, error
+            code, message = classify_provider_error(exc)
+            await self._emit_error(turn_id, "llm", code, message)
+            return "", 0, error, True
 
         parts: list[str] = []
         index = 0
         error: str | None = None
+        skip_tts = False
         try:
             self._latency.mark("llm_start")
             async for token in stream_with_retry(
@@ -375,24 +481,24 @@ class PipelineOrchestrator:
                 index += 1
         except StageTimeoutError as exc:
             error = str(exc)
-            if exc.ttft:
-                detail = (
-                    f"LLM did not produce a first token within "
-                    f"{self._settings.llm_ttft_timeout_s:.0f}s"
-                )
+            if index == 0:
+                skip_tts = True
+                detail = MSG_LLM_TIMEOUT
             else:
-                detail = f"LLM did not finish within {self._settings.llm_timeout_s:.0f}s"
+                detail = MSG_PARTIAL_LLM
             logger.warning(
                 "llm timeout session=%s turn=%s partial=%s",
                 self._session_id,
                 turn_id,
                 index,
             )
-            await self._emit_error(turn_id, "llm", "TIMEOUT", detail)
+            await self._emit_error(turn_id, "llm", TIMEOUT, detail)
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
             logger.exception("llm stream failed session=%s turn=%s", self._session_id, turn_id)
-            await self._emit_error(turn_id, "llm", "LLM_STREAM_FAILED", error)
+            detail = MSG_PARTIAL_LLM if index > 0 else MSG_LLM_TIMEOUT
+            skip_tts = index == 0
+            await self._emit_error(turn_id, "llm", STREAM_FAILED, detail)
 
         full = "".join(parts) if parts else (LLM_TIMEOUT_FALLBACK if error else "")
         self._latency.mark("llm_complete")
@@ -405,7 +511,7 @@ class PipelineOrchestrator:
                 "text": full,
             }
         )
-        return full, index, error
+        return full, index, error, skip_tts
 
     async def _stream_tts(
         self,
@@ -415,20 +521,26 @@ class PipelineOrchestrator:
         *,
         transcript: str,
         token_count: int,
+        force_skip_tts: bool = False,
     ) -> dict[str, int | bool]:
         seq = 0
-        skipped = not text
+        skipped = not text or force_skip_tts
         tts_error: str | None = None
         self._latency.set_tts_skipped(skipped)
         trace.begin_tts()
 
-        if text:
+        if text and not force_skip_tts:
             try:
                 provider = get_tts_provider(self._settings)
             except Exception as exc:  # noqa: BLE001
                 tts_error = str(exc)
                 logger.exception("tts start failed session=%s turn=%s", self._session_id, turn_id)
-                await self._emit_error(turn_id, "tts", "TTS_UNAVAILABLE", tts_error)
+                code, message = classify_provider_error(exc)
+                if code == PROVIDER_DOWN:
+                    message = MSG_TTS_DOWN
+                await self._emit_error(turn_id, "tts", code, message)
+                skipped = True
+                self._latency.set_tts_skipped(True)
                 provider = None
 
             if provider is not None:
@@ -458,27 +570,23 @@ class PipelineOrchestrator:
                         seq += 1
                 except StageTimeoutError as exc:
                     tts_error = str(exc)
+                    skipped = seq == 0
+                    self._latency.set_tts_skipped(skipped)
                     logger.warning(
                         "tts timeout session=%s turn=%s chunks=%s",
                         self._session_id,
                         turn_id,
                         seq,
                     )
-                    await self._emit_error(
-                        turn_id,
-                        "tts",
-                        "TIMEOUT",
-                        (
-                            f"TTS did not finish within {self._settings.tts_timeout_s:.0f}s; "
-                            "reply shown as text only"
-                        ),
-                    )
+                    await self._emit_error(turn_id, "tts", TIMEOUT, MSG_TTS_DOWN)
                 except Exception as exc:  # noqa: BLE001
                     tts_error = str(exc)
+                    skipped = seq == 0
+                    self._latency.set_tts_skipped(skipped)
                     logger.exception(
                         "tts stream failed session=%s turn=%s", self._session_id, turn_id
                     )
-                    await self._emit_error(turn_id, "tts", "TTS_STREAM_FAILED", tts_error)
+                    await self._emit_error(turn_id, "tts", STREAM_FAILED, MSG_TTS_DOWN)
                 else:
                     self._latency.mark("tts_complete")
 
