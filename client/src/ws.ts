@@ -99,6 +99,11 @@ export class VoxwireClient {
     this.send(this.envelope("utterance_end", turnId, extra));
   }
 
+  /** Typed fallback when ASR is unavailable (issue #20). */
+  textTurn(turnId: string, text: string): void {
+    this.send(this.envelope("text_turn", turnId, { text }));
+  }
+
   ping(): void {
     this.send(this.envelope("ping", null, { payload: { sentAt: Date.now() } }));
   }

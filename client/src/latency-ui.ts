@@ -52,6 +52,14 @@ const STAGE_LABELS: Record<string, string> = {
   overhead: "Overhead",
 };
 
+const STAGE_DESCRIPTIONS: Record<string, string> = {
+  asr: "Speech recognition",
+  llm: "LLM reply (through first token)",
+  tts: "Text-to-speech (first audio byte)",
+  overhead: "Pipeline finish",
+  upload: "Audio upload",
+};
+
 export function formatMs(ms: number | null | undefined): string {
   if (ms == null || ms < 0) return "—";
   if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
@@ -236,6 +244,63 @@ export class LatencyUi {
     return card;
   }
 
+  private segmentBar(
+    seg: TimelineSegment,
+    totalMs: number,
+    bottleneck: string | null,
+    index: number,
+    count: number,
+  ): HTMLDivElement {
+    const pct = (seg.durationMs / totalMs) * 100;
+    const isBottleneck = bottleneck != null && seg.stage === bottleneck;
+    const bar = document.createElement("div");
+    bar.className = "latency-seg";
+    if (isBottleneck) bar.classList.add("bottleneck");
+    bar.style.width = `${pct}%`;
+    bar.style.background = `var(${seg.cssVar})`;
+    bar.tabIndex = 0;
+
+    const tip = document.createElement("span");
+    tip.className = "latency-seg-tooltip";
+    tip.setAttribute("role", "tooltip");
+
+    const title = document.createElement("strong");
+    title.textContent = seg.label;
+    tip.appendChild(title);
+
+    const desc = STAGE_DESCRIPTIONS[seg.stage];
+    if (desc) {
+      const descEl = document.createElement("span");
+      descEl.className = "latency-seg-tooltip-desc";
+      descEl.textContent = desc;
+      tip.appendChild(descEl);
+    }
+
+    const meta = document.createElement("span");
+    meta.className = "latency-seg-tooltip-meta";
+    meta.textContent = `${formatMs(seg.durationMs)} · ${pct.toFixed(0)}% of server total`;
+    tip.appendChild(meta);
+
+    if (isBottleneck) {
+      const bn = document.createElement("span");
+      bn.className = "latency-seg-tooltip-bn";
+      bn.textContent = "Bottleneck";
+      tip.appendChild(bn);
+    }
+
+    bar.appendChild(tip);
+
+    const label = document.createElement("span");
+    label.className = "latency-seg-label";
+    label.textContent = pct >= 14 ? `${seg.label} ${formatMs(seg.durationMs)}` : formatMs(seg.durationMs);
+    bar.appendChild(label);
+
+    if (index === 0) bar.classList.add("seg-first");
+    if (index === count - 1) bar.classList.add("seg-last");
+
+    return bar;
+  }
+
   private renderWaterfall(row: TurnLatencyRow): void {
     const { stages } = row.report;
     const bottleneck = row.bottleneckStage;
@@ -269,21 +334,9 @@ export class LatencyUi {
         segments.map((s) => `${s.label} ${formatMs(s.durationMs)}`).join(", "),
       );
 
-      for (const seg of segments) {
-        const pct = (seg.durationMs / row.totalMs) * 100;
-        const bar = document.createElement("div");
-        bar.className = "latency-seg";
-        if (bottleneck && seg.stage === bottleneck) bar.classList.add("bottleneck");
-        bar.style.width = `${pct}%`;
-        bar.style.background = `var(${seg.cssVar})`;
-        bar.title = `${seg.label}: ${formatMs(seg.durationMs)}`;
-
-        const label = document.createElement("span");
-        label.className = "latency-seg-label";
-        label.textContent = pct >= 14 ? `${seg.label} ${formatMs(seg.durationMs)}` : formatMs(seg.durationMs);
-        bar.appendChild(label);
-        track.appendChild(bar);
-      }
+      segments.forEach((seg, i) => {
+        track.appendChild(this.segmentBar(seg, row.totalMs, bottleneck, i, segments.length));
+      });
       block.appendChild(track);
 
       const legend = document.createElement("p");
@@ -316,8 +369,26 @@ export class LatencyUi {
     const pct = Math.min(100, (captureMs / maxMs) * 100);
 
     const bar = document.createElement("div");
-    bar.className = "latency-seg capture-seg";
+    bar.className = "latency-seg capture-seg seg-first seg-last";
     bar.style.width = `${pct}%`;
+    bar.tabIndex = 0;
+
+    const tip = document.createElement("span");
+    tip.className = "latency-seg-tooltip";
+    tip.setAttribute("role", "tooltip");
+    const title = document.createElement("strong");
+    title.textContent = "Mic capture";
+    tip.appendChild(title);
+    const descEl = document.createElement("span");
+    descEl.className = "latency-seg-tooltip-desc";
+    descEl.textContent = "While holding push-to-talk";
+    tip.appendChild(descEl);
+    const meta = document.createElement("span");
+    meta.className = "latency-seg-tooltip-meta";
+    meta.textContent = formatMs(captureMs);
+    tip.appendChild(meta);
+    bar.appendChild(tip);
+
     const label = document.createElement("span");
     label.className = "latency-seg-label";
     label.textContent = formatMs(captureMs);
