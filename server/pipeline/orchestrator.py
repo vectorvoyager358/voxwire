@@ -29,6 +29,7 @@ from server.latency import LatencyTracker
 from server.observability import TurnTrace, get_turn_tracer
 from server.pipeline.errors import (
     BAD_REQUEST,
+    BREAKER_OPEN,
     MSG_ASR_DOWN,
     MSG_LLM_TIMEOUT,
     MSG_PARTIAL_LLM,
@@ -36,14 +37,20 @@ from server.pipeline.errors import (
     PROVIDER_DOWN,
     STREAM_FAILED,
     TIMEOUT,
+    breaker_message,
     classify_provider_error,
-    is_recoverable,
+    error_recoverable,
 )
 from server.providers.asr import ASRSession, Transcript, get_asr_provider
 from server.providers.llm import get_llm_provider
 from server.providers.tts import TTS_ENCODING, TTS_SAMPLE_RATE, get_tts_provider
 from server.replay.recorder import TurnRecorder
-from server.resilience import StageTimeoutError, run_with_timeout_and_retry, stream_with_retry
+from server.resilience import (
+    StageBreakers,
+    StageTimeoutError,
+    run_with_timeout_and_retry,
+    stream_with_retry,
+)
 
 logger = logging.getLogger("voxwire.pipeline")
 
@@ -115,7 +122,13 @@ class PipelineOrchestrator:
         self._stats = TurnStats()
         self._asr_session: ASRSession | None = None
         self._asr_turn_id: str | None = None
+        self._active_turn_id: str | None = None
         self._degraded = False
+        self._degraded_mode: list[str] = []
+        self._breakers = StageBreakers(
+            failure_threshold=self._settings.breaker_failure_threshold,
+            cooldown_s=self._settings.breaker_cooldown_s,
+        )
         self._recorder = TurnRecorder(
             session_id,
             Path(self._settings.recordings_dir),
@@ -139,14 +152,18 @@ class PipelineOrchestrator:
 
     async def on_audio_chunk(self, message: dict) -> None:
         """Stream one upstream audio chunk to the ASR provider."""
-        self._stats.accumulate_chunk(message)
         turn_id = message.get("turnId")
+        if turn_id and turn_id != self._active_turn_id:
+            self._degraded = False
+            self._degraded_mode = []
+            self._active_turn_id = turn_id
+        self._stats.accumulate_chunk(message)
         if turn_id:
             self._recorder.begin_turn(turn_id)
             self._begin_turn_tracking(turn_id)
             self._latency.mark("first_audio_chunk")
             self._latency.mark("last_audio_chunk")
-        if self._asr_session is None or self._asr_turn_id != turn_id:
+        if self._asr_turn_id != turn_id:
             if self._asr_session is not None:
                 await self._asr_session.aclose()
                 self._asr_session = None
@@ -157,7 +174,6 @@ class PipelineOrchestrator:
 
     async def on_utterance_end(self, message: dict) -> None:
         """Finalize ASR, run LLM + TTS, emit capture_summary and turn_complete."""
-        self._degraded = False
         turn_id = message.get("turnId")
         if turn_id:
             self._begin_turn_tracking(turn_id)
@@ -231,8 +247,10 @@ class PipelineOrchestrator:
 
     async def on_text_turn(self, message: dict) -> None:
         """Run LLM + TTS for typed input when ASR is unavailable (issue #20)."""
-        self._degraded = False
         turn_id = message.get("turnId")
+        self._degraded = False
+        self._degraded_mode = []
+        self._active_turn_id = turn_id
         text = str(message.get("text") or "").strip()
         if not turn_id:
             return
@@ -330,25 +348,68 @@ class PipelineOrchestrator:
         detail: str,
         *,
         recoverable: bool | None = None,
+        cooldown_ms: int | None = None,
+        counts_toward_breaker: bool = True,
     ) -> None:
         self._degraded = True
+        self._note_degraded_mode(stage)
         self._latency.set_failed_stage(stage)
         if recoverable is None:
-            recoverable = is_recoverable(code)
-        await self._emit(
-            {
-                "type": "error",
-                "sessionId": self._session_id,
-                "turnId": turn_id,
-                "timestamp": _now_iso(),
-                "stage": stage,
-                "code": code,
-                "recoverable": recoverable,
-                "message": detail,
-            }
+            recoverable = error_recoverable(stage, code)
+        breaker_opened = False
+        if counts_toward_breaker and code != BREAKER_OPEN:
+            breaker_opened = self._breakers.record_failure(stage)
+            if breaker_opened:
+                logger.warning(
+                    "breaker opened session=%s stage=%s failures=%s",
+                    self._session_id,
+                    stage,
+                    self._settings.breaker_failure_threshold,
+                )
+        if breaker_opened:
+            code = BREAKER_OPEN
+            detail = breaker_message(stage)
+            recoverable = False
+            if cooldown_ms is None:
+                cooldown_ms = int(self._breakers.cooldown_remaining_s(stage) * 1000)
+        payload: dict = {
+            "type": "error",
+            "sessionId": self._session_id,
+            "turnId": turn_id,
+            "timestamp": _now_iso(),
+            "stage": stage,
+            "code": code,
+            "recoverable": recoverable,
+            "message": detail,
+        }
+        if cooldown_ms is not None:
+            payload["cooldownMs"] = cooldown_ms
+        await self._emit(payload)
+
+    def _note_degraded_mode(self, stage: str) -> None:
+        if stage not in self._degraded_mode:
+            self._degraded_mode.append(stage)
+
+    async def _guard_stage(self, stage: str, turn_id: str | None) -> bool:
+        """Return False when the breaker is open and the stage must be skipped."""
+        if self._breakers.allow(stage):
+            return True
+        cooldown_ms = int(self._breakers.cooldown_remaining_s(stage) * 1000)
+        await self._emit_error(
+            turn_id,
+            stage,
+            BREAKER_OPEN,
+            breaker_message(stage),
+            recoverable=False,
+            cooldown_ms=cooldown_ms,
+            counts_toward_breaker=False,
         )
+        return False
 
     async def _start_asr(self, turn_id: str | None) -> ASRSession | None:
+        if not await self._guard_stage("asr", turn_id):
+            return None
+
         async def on_transcript(transcript: Transcript) -> None:
             if not transcript.text:
                 return
@@ -395,6 +456,9 @@ class PipelineOrchestrator:
     async def _finalize_asr(
         self, session: ASRSession, turn_id: str | None
     ) -> tuple[str, str | None]:
+        if not await self._guard_stage("asr", turn_id):
+            return "", breaker_message("asr")
+
         text = ""
         error: str | None = None
         try:
@@ -405,6 +469,7 @@ class PipelineOrchestrator:
                 backoff_ms=self._settings.retry_backoff_ms,
             )
             self._latency.mark("asr_final")
+            self._breakers.record_success("asr")
             await self._emit(
                 {
                     "type": "transcript_final",
@@ -442,6 +507,9 @@ class PipelineOrchestrator:
     async def _run_llm(
         self, turn_id: str | None, user_text: str
     ) -> tuple[str, int, str | None, bool]:
+        if not await self._guard_stage("llm", turn_id):
+            return "", 0, breaker_message("llm"), True
+
         try:
             provider = get_llm_provider(self._settings)
         except Exception as exc:  # noqa: BLE001
@@ -501,6 +569,8 @@ class PipelineOrchestrator:
             await self._emit_error(turn_id, "llm", STREAM_FAILED, detail)
 
         full = "".join(parts) if parts else (LLM_TIMEOUT_FALLBACK if error else "")
+        if error is None:
+            self._breakers.record_success("llm")
         self._latency.mark("llm_complete")
         await self._emit(
             {
@@ -530,65 +600,73 @@ class PipelineOrchestrator:
         trace.begin_tts()
 
         if text and not force_skip_tts:
-            try:
-                provider = get_tts_provider(self._settings)
-            except Exception as exc:  # noqa: BLE001
-                tts_error = str(exc)
-                logger.exception("tts start failed session=%s turn=%s", self._session_id, turn_id)
-                code, message = classify_provider_error(exc)
-                if code == PROVIDER_DOWN:
-                    message = MSG_TTS_DOWN
-                await self._emit_error(turn_id, "tts", code, message)
+            if not await self._guard_stage("tts", turn_id):
                 skipped = True
                 self._latency.set_tts_skipped(True)
-                provider = None
-
-            if provider is not None:
+                tts_error = breaker_message("tts")
+            else:
                 try:
-                    self._latency.mark("tts_start")
-                    async for pcm in stream_with_retry(
-                        lambda: provider.stream(text),
-                        stage="tts",
-                        timeout_s=self._settings.tts_timeout_s,
-                        backoff_ms=self._settings.retry_backoff_ms,
-                    ):
-                        if not pcm:
-                            continue
-                        self._latency.mark("tts_first_byte")
-                        await self._emit(
-                            {
-                                "type": "tts_audio_chunk",
-                                "sessionId": self._session_id,
-                                "turnId": turn_id,
-                                "timestamp": _now_iso(),
-                                "seq": seq,
-                                "encoding": TTS_ENCODING,
-                                "sampleRate": TTS_SAMPLE_RATE,
-                                "data": base64.b64encode(pcm).decode(),
-                            }
-                        )
-                        seq += 1
-                except StageTimeoutError as exc:
-                    tts_error = str(exc)
-                    skipped = seq == 0
-                    self._latency.set_tts_skipped(skipped)
-                    logger.warning(
-                        "tts timeout session=%s turn=%s chunks=%s",
-                        self._session_id,
-                        turn_id,
-                        seq,
-                    )
-                    await self._emit_error(turn_id, "tts", TIMEOUT, MSG_TTS_DOWN)
+                    provider = get_tts_provider(self._settings)
                 except Exception as exc:  # noqa: BLE001
                     tts_error = str(exc)
-                    skipped = seq == 0
-                    self._latency.set_tts_skipped(skipped)
                     logger.exception(
-                        "tts stream failed session=%s turn=%s", self._session_id, turn_id
+                        "tts start failed session=%s turn=%s", self._session_id, turn_id
                     )
-                    await self._emit_error(turn_id, "tts", STREAM_FAILED, MSG_TTS_DOWN)
-                else:
-                    self._latency.mark("tts_complete")
+                    code, message = classify_provider_error(exc)
+                    if code == PROVIDER_DOWN:
+                        message = MSG_TTS_DOWN
+                    await self._emit_error(turn_id, "tts", code, message)
+                    skipped = True
+                    self._latency.set_tts_skipped(True)
+                    provider = None
+
+                if provider is not None:
+                    try:
+                        self._latency.mark("tts_start")
+                        async for pcm in stream_with_retry(
+                            lambda: provider.stream(text),
+                            stage="tts",
+                            timeout_s=self._settings.tts_timeout_s,
+                            backoff_ms=self._settings.retry_backoff_ms,
+                        ):
+                            if not pcm:
+                                continue
+                            self._latency.mark("tts_first_byte")
+                            await self._emit(
+                                {
+                                    "type": "tts_audio_chunk",
+                                    "sessionId": self._session_id,
+                                    "turnId": turn_id,
+                                    "timestamp": _now_iso(),
+                                    "seq": seq,
+                                    "encoding": TTS_ENCODING,
+                                    "sampleRate": TTS_SAMPLE_RATE,
+                                    "data": base64.b64encode(pcm).decode(),
+                                }
+                            )
+                            seq += 1
+                    except StageTimeoutError as exc:
+                        tts_error = str(exc)
+                        skipped = seq == 0
+                        self._latency.set_tts_skipped(skipped)
+                        logger.warning(
+                            "tts timeout session=%s turn=%s chunks=%s",
+                            self._session_id,
+                            turn_id,
+                            seq,
+                        )
+                        await self._emit_error(turn_id, "tts", TIMEOUT, MSG_TTS_DOWN)
+                    except Exception as exc:  # noqa: BLE001
+                        tts_error = str(exc)
+                        skipped = seq == 0
+                        self._latency.set_tts_skipped(skipped)
+                        logger.exception(
+                            "tts stream failed session=%s turn=%s", self._session_id, turn_id
+                        )
+                        await self._emit_error(turn_id, "tts", STREAM_FAILED, MSG_TTS_DOWN)
+                    else:
+                        self._latency.mark("tts_complete")
+                        self._breakers.record_success("tts")
 
         self._latency.mark("turn_complete")
         latency_report = self._latency.build_report(degraded=self._degraded)
@@ -608,11 +686,12 @@ class PipelineOrchestrator:
         )
         self._turn_trace = None
         logger.info(
-            "latency turn=%s total_ms=%s bottleneck=%s failed=%s",
+            "latency turn=%s total_ms=%s bottleneck=%s failed=%s degraded_mode=%s",
             turn_id,
             latency_report["totalMs"],
             latency_report["bottleneckStage"],
             latency_report["failedStage"],
+            self._degraded_mode or None,
         )
         await self._emit(
             {
@@ -631,6 +710,7 @@ class PipelineOrchestrator:
                 "timestamp": _now_iso(),
                 "meta": {
                     "degraded": self._degraded,
+                    "degradedMode": self._degraded_mode or None,
                     "ttsSkipped": skipped,
                     "ttsChunks": seq,
                     "latency": latency_report["meta"],
