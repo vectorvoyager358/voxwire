@@ -31,7 +31,7 @@ class _FailingTTSProvider(TTSProvider):
         yield b""  # pragma: no cover
 
 
-def test_llm_config_error_is_not_recoverable(
+def test_llm_config_error_allows_in_session_retry(
     monkeypatch: pytest.MonkeyPatch,
     fake_asr: FakeASRProvider,
 ) -> None:
@@ -50,7 +50,7 @@ def test_llm_config_error_is_not_recoverable(
     events = asyncio.run(run())
     err = next(e for e in events if e["type"] == "error")
     assert err["code"] == CONFIG_ERROR
-    assert err["recoverable"] is False
+    assert err["recoverable"] is True
     assert events[-1]["meta"]["degraded"] is True
     assert events[-1]["meta"]["ttsSkipped"] is True
 

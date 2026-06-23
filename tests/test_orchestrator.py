@@ -66,7 +66,7 @@ def test_orchestrator_degraded_on_llm_failure(
     complete = events[-1]
     assert errors and errors[0]["stage"] == "llm"
     assert errors[0]["code"] == "CONFIG_ERROR"
-    assert errors[0]["recoverable"] is False
+    assert errors[0]["recoverable"] is True
     assert complete["type"] == "turn_complete"
     assert complete["meta"]["degraded"] is True
     assert fake_tts.received == []

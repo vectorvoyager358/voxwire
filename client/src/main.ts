@@ -41,6 +41,7 @@ interface LatencySummaryMeta {
 
 interface TurnCompleteMeta {
   degraded?: boolean;
+  degradedMode?: string[] | null;
   ttsSkipped?: boolean;
   ttsChunks?: number;
   latency?: LatencySummaryMeta;
@@ -58,6 +59,7 @@ interface ServerMessage {
   code?: string;
   message?: string;
   recoverable?: boolean;
+  cooldownMs?: number;
   meta?: TurnCompleteMeta | LatencySummaryMeta;
   totalMs?: number;
   bottleneckStage?: string | null;
@@ -139,8 +141,11 @@ const player = new TtsPlayer((info) => {
 
 let activeTurn: ActiveTurn | null = null;
 let pttBlocked = false;
+let pttCooldownTimer: number | null = null;
+const ASR_PTT_COOLDOWN_KEY = "voxwire.asrPttCooldownUntil";
 let showTextFallback = false;
 let lastRecoverableError: { stage: string; message: string } | null = null;
+let lastHardError: { stage: string; message: string } | null = null;
 
 const STAGE_LABELS: Record<string, string> = {
   asr: "Speech recognition",
@@ -160,6 +165,7 @@ function hideBanner(): void {
   bannerActionsEl.hidden = true;
   bannerEl.className = "banner";
   lastRecoverableError = null;
+  lastHardError = null;
 }
 
 function showErrorBanner(
@@ -346,11 +352,63 @@ function clearChat(): void {
   activeTurn = null;
 }
 
+function clearAsrPttCooldown(): void {
+  pttCooldownTimer = null;
+  sessionStorage.removeItem(ASR_PTT_COOLDOWN_KEY);
+  pttBlocked = false;
+  if (client?.connected) {
+    setTalkEnabled(true);
+    hideBanner();
+    setPipelineState("idle");
+  }
+}
+
+function blockAsrPtt(cooldownMs: number, message: string): void {
+  pttBlocked = true;
+  setTalkEnabled(false);
+  setTextFallbackVisible(true);
+  sessionStorage.setItem(ASR_PTT_COOLDOWN_KEY, String(Date.now() + cooldownMs));
+  if (pttCooldownTimer !== null) {
+    window.clearTimeout(pttCooldownTimer);
+  }
+  pttCooldownTimer = window.setTimeout(() => clearAsrPttCooldown(), cooldownMs);
+  showErrorBanner("asr", message, { recoverable: false, kind: "error", showRetry: false });
+}
+
+function restoreAsrPttCooldownIfActive(): boolean {
+  const raw = sessionStorage.getItem(ASR_PTT_COOLDOWN_KEY);
+  if (!raw) return false;
+  const remaining = Number(raw) - Date.now();
+  if (!Number.isFinite(remaining) || remaining <= 0) {
+    sessionStorage.removeItem(ASR_PTT_COOLDOWN_KEY);
+    return false;
+  }
+  pttBlocked = true;
+  setTalkEnabled(false);
+  setTextFallbackVisible(true);
+  if (pttCooldownTimer !== null) {
+    window.clearTimeout(pttCooldownTimer);
+  }
+  pttCooldownTimer = window.setTimeout(() => clearAsrPttCooldown(), remaining);
+  showErrorBanner("asr", "Speech recognition unavailable. Try again shortly.", {
+    recoverable: false,
+    kind: "error",
+    showRetry: false,
+  });
+  setPipelineState("error");
+  return true;
+}
+
 function resetSessionUi(): void {
   clearChat();
   hideBanner();
   setTextFallbackVisible(false);
   pttBlocked = false;
+  if (pttCooldownTimer !== null) {
+    window.clearTimeout(pttCooldownTimer);
+    pttCooldownTimer = null;
+  }
+  // Keep sessionStorage cooldown so reconnect cannot bypass an open ASR breaker.
   utteranceEndAt.clear();
   feltLatencyMs.clear();
   latencyUi.clear();
@@ -415,7 +473,16 @@ function handleMessage(data: unknown): void {
     }
     case "turn_complete": {
       finishTurn(msg.meta);
-      if (msg.meta?.degraded && lastRecoverableError) {
+      if (pttBlocked) {
+        setPipelineState("error");
+      } else if (lastHardError) {
+        showErrorBanner(lastHardError.stage, lastHardError.message, {
+          recoverable: false,
+          kind: "error",
+          showRetry: false,
+        });
+        setPipelineState("error");
+      } else if (msg.meta?.degraded && lastRecoverableError) {
         showErrorBanner(lastRecoverableError.stage, lastRecoverableError.message, {
           recoverable: true,
           kind: "warn",
@@ -440,11 +507,20 @@ function handleMessage(data: unknown): void {
       log(`<- error [${stage}] ${msg.code ?? "?"} ${detail}`, "sys");
       setPipelineState("error");
       if (!recoverable) {
-        pttBlocked = true;
-        setTalkEnabled(false);
-        setTextFallbackVisible(false);
+        if (msg.code === "BREAKER_OPEN" && stage === "asr") {
+          blockAsrPtt(msg.cooldownMs ?? 60_000, detail);
+          return;
+        }
+        // Only ASR hard failures block the mic; LLM/TTS errors keep voice input available.
+        if (stage === "asr") {
+          pttBlocked = true;
+          setTalkEnabled(false);
+          setTextFallbackVisible(false);
+        }
+        lastHardError = { stage, message: detail };
         showErrorBanner(stage, detail, { recoverable: false, kind: "error", showRetry: false });
       } else {
+        lastHardError = null;
         showErrorBanner(stage, detail, { recoverable: true, kind: "warn", showRetry: true });
       }
       return;
@@ -473,9 +549,11 @@ connectBtn.addEventListener("click", () => {
     onStatus: (status) => {
       setStatus(status);
       if (status === "connected") {
-        hideBanner();
-        pttBlocked = false;
-        setPipelineState("idle");
+        if (!restoreAsrPttCooldownIfActive()) {
+          hideBanner();
+          pttBlocked = false;
+          setPipelineState("idle");
+        }
         log(`connected (session ${client?.id})`, "sys");
         client?.sessionStart({
           encoding: CAPTURE_ENCODING,

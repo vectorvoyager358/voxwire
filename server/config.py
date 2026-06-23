@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     retry_backoff_ms_min: int = 200
     retry_backoff_ms_max: int = 500
 
+    # --- Circuit breaker (Phase 3, issue #21) ---
+    breaker_failure_threshold: int = 3
+    breaker_cooldown_s: float = 60.0
+
     @property
     def retry_backoff_ms(self) -> tuple[int, int]:
         return (self.retry_backoff_ms_min, self.retry_backoff_ms_max)
