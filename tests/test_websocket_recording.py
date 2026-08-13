@@ -74,10 +74,17 @@ def test_degraded_websocket_turn_is_recorded_in_protocol_order(
     assert asr.last_session is not None and asr.last_session.closed is True
 
     event_types = [event["type"] for event in emitted]
-    error_index = event_types.index("error")
-    latency_index = event_types.index("latency_report")
-    complete_index = event_types.index("turn_complete")
-    assert error_index < latency_index < complete_index == len(emitted) - 1
+    assert event_types == [
+        "transcript_partial",
+        "transcript_final",
+        "error",
+        "capture_summary",
+        "latency_report",
+        "turn_complete",
+    ]
+    error_index = 2
+    latency_index = 4
+    complete_index = 5
 
     error = emitted[error_index]
     assert error["stage"] == "llm"
