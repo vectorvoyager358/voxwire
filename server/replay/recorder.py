@@ -15,13 +15,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from server.providers.asr import ASR_SAMPLE_RATE
-
-logger = logging.getLogger("voxwire.recordings")
-
-# Upstream capture format (matches docs/event-protocol.md).
+# Upstream capture format (docs/event-protocol.md).
 CAPTURE_ENCODING = "pcm_s16le"
 CAPTURE_CHANNELS = 1
+CAPTURE_SAMPLE_RATE = 16000
+
+logger = logging.getLogger("voxwire.recordings")
 
 
 def _now_iso() -> str:
@@ -86,7 +85,7 @@ class TurnRecorder:
             "timestamp": _now_iso(),
             "audioFile": audio_path.name if self._audio else None,
             "audioEncoding": CAPTURE_ENCODING,
-            "audioSampleRate": ASR_SAMPLE_RATE,
+            "audioSampleRate": CAPTURE_SAMPLE_RATE,
             "audioChannels": CAPTURE_CHANNELS,
             "audioBytes": len(self._audio),
             "transcriptLength": len(transcript),

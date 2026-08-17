@@ -7,8 +7,19 @@ import {
   CAPTURE_ENCODING,
   CAPTURE_SAMPLE_RATE,
 } from "./audio";
-import { TtsPlayer } from "./playback";
+import { TtsPlayer, shouldEnqueueTts } from "./playback";
 import { LatencyUi, type LatencyReport } from "./latency-ui";
+import {
+  BUNDLED_SAMPLES,
+  CUSTOM_SAMPLE,
+  fullReplayAvailable,
+  isBundledSamplePath,
+  recordingPathForSample,
+  recordingPathForTurnId,
+  replayedErrorBanner,
+  replayStartPayload,
+  type ReplayMode,
+} from "./replay";
 
 const connectBtn = document.getElementById("connect") as HTMLButtonElement;
 const pingBtn = document.getElementById("ping") as HTMLButtonElement;
@@ -31,6 +42,13 @@ const textFallbackSend = document.getElementById("textFallbackSend") as HTMLButt
 const latencyStats = document.getElementById("latencyStats") as HTMLDivElement;
 const latencyWaterfall = document.getElementById("latencyWaterfall") as HTMLDivElement;
 const latencyTableBody = document.getElementById("latencyTableBody") as HTMLTableSectionElement;
+const replaySample = document.getElementById("replaySample") as HTMLSelectElement;
+const replayMode = document.getElementById("replayMode") as HTMLSelectElement;
+const replayBtn = document.getElementById("replay") as HTMLButtonElement;
+const replayPath = document.getElementById("replayPath") as HTMLInputElement;
+const replayExtra = document.getElementById("replayExtra") as HTMLDivElement;
+const replayMockWrap = document.getElementById("replayMockWrap") as HTMLLabelElement;
+const replayMockLlm = document.getElementById("replayMockLlm") as HTMLInputElement;
 
 interface LatencySummaryMeta {
   totalMs?: number;
@@ -114,6 +132,15 @@ function setTalkEnabled(enabled: boolean): void {
   talkBtn.disabled = !enabled || !client?.connected;
 }
 
+function setReplayEnabled(enabled: boolean): void {
+  const on = enabled && !!client?.connected;
+  replaySample.disabled = !on;
+  replayMode.disabled = !on;
+  replayBtn.disabled = !on;
+  replayPath.disabled = !on;
+  replayMockLlm.disabled = !on;
+}
+
 function setStatus(status: ConnectionStatus): void {
   dot.className = `dot ${status}`;
   statusText.textContent = status;
@@ -122,11 +149,14 @@ function setStatus(status: ConnectionStatus): void {
   connectBtn.textContent = connected ? "Disconnect" : "Connect";
   connectBtn.disabled = status === "connecting";
   setTalkEnabled(connected && !pttBlocked);
+  setReplayEnabled(connected);
 }
 
 let client: VoxwireClient | null = null;
 const capture = new AudioCapture();
-const latencyUi = new LatencyUi(latencyStats, latencyWaterfall, latencyTableBody);
+const latencyUi = new LatencyUi(latencyStats, latencyWaterfall, latencyTableBody, (turnId) => {
+  startReplay(turnRecordingPaths.get(turnId) ?? recordingPathForTurnId(turnId));
+});
 const utteranceEndAt = new Map<string, number>();
 const feltLatencyMs = new Map<string, number>();
 
@@ -140,6 +170,9 @@ const player = new TtsPlayer((info) => {
 });
 
 let activeTurn: ActiveTurn | null = null;
+const replayTurns = new Set<string>();
+const turnRecordingPaths = new Map<string, string>();
+let playbackTurnId: string | null = null;
 let pttBlocked = false;
 let pttCooldownTimer: number | null = null;
 const ASR_PTT_COOLDOWN_KEY = "voxwire.asrPttCooldownUntil";
@@ -270,6 +303,40 @@ function makeBubble(
   return { root, text, copyBtn };
 }
 
+function addReplayBadge(footnote: HTMLParagraphElement): void {
+  const badge = document.createElement("span");
+  badge.className = "turn-badge replay";
+  badge.textContent = "Replay";
+  footnote.appendChild(badge);
+}
+
+function addTurnReplayControls(footnote: HTMLParagraphElement, turnId: string): void {
+  const path = turnRecordingPaths.get(turnId) ?? recordingPathForTurnId(turnId);
+  const idEl = document.createElement("span");
+  idEl.className = "turn-id";
+  idEl.title = path;
+  idEl.textContent = path;
+
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "copy-btn";
+  copyBtn.setAttribute("aria-label", "Copy recording path");
+  copyBtn.title = "Copy path";
+  setCopyButtonIcon(copyBtn);
+  const pathText = document.createElement("span");
+  pathText.textContent = path;
+  copyBtn.addEventListener("click", () => void copyMessage(copyBtn, pathText));
+
+  const replay = document.createElement("button");
+  replay.type = "button";
+  replay.className = "secondary turn-replay";
+  replay.textContent = "Replay";
+  replay.title = `Replay ${path}`;
+  replay.addEventListener("click", () => startReplay(path));
+
+  footnote.append(idEl, copyBtn, replay);
+}
+
 function ensureTurn(turnId: string): ActiveTurn {
   if (activeTurn?.turnId === turnId) return activeTurn;
 
@@ -280,6 +347,10 @@ function ensureTurn(turnId: string): ActiveTurn {
   const footnote = document.createElement("p");
   footnote.className = "turn-footnote";
   footnote.hidden = true;
+  if (replayTurns.has(turnId)) {
+    addReplayBadge(footnote);
+    footnote.hidden = false;
+  }
   block.append(youBubble.root, assistantBubble.root, footnote);
   chatLog.appendChild(block);
   scrollChatToBottom();
@@ -329,7 +400,15 @@ function setAssistantComplete(text: string): void {
 
 function finishTurn(meta?: TurnCompleteMeta): void {
   if (!activeTurn) return;
+  const turnId = activeTurn.turnId;
+  const isReplay = replayTurns.has(turnId);
+  if (!turnRecordingPaths.has(turnId)) {
+    turnRecordingPaths.set(turnId, recordingPathForTurnId(turnId));
+  }
   activeTurn.footnote.replaceChildren();
+  if (isReplay) {
+    addReplayBadge(activeTurn.footnote);
+  }
   if (meta?.degraded) {
     const badge = document.createElement("span");
     badge.className = "turn-badge degraded";
@@ -342,7 +421,8 @@ function finishTurn(meta?: TurnCompleteMeta): void {
     badge.textContent = "Text only — no audio";
     activeTurn.footnote.appendChild(badge);
   }
-  activeTurn.footnote.hidden = activeTurn.footnote.childElementCount === 0;
+  addTurnReplayControls(activeTurn.footnote, turnId);
+  activeTurn.footnote.hidden = false;
   activeTurn = null;
   scrollChatToBottom();
 }
@@ -401,6 +481,9 @@ function restoreAsrPttCooldownIfActive(): boolean {
 
 function resetSessionUi(): void {
   clearChat();
+  replayTurns.clear();
+  turnRecordingPaths.clear();
+  playbackTurnId = null;
   hideBanner();
   setTextFallbackVisible(false);
   pttBlocked = false;
@@ -449,7 +532,11 @@ function handleMessage(data: unknown): void {
       log("<- llm_complete", "in");
       return;
     case "tts_audio_chunk":
-      if (typeof msg.turnId === "string" && typeof msg.data === "string") {
+      if (
+        typeof msg.turnId === "string" &&
+        typeof msg.data === "string" &&
+        shouldEnqueueTts(playbackTurnId, msg.turnId)
+      ) {
         player.enqueue(msg.turnId, msg.seq ?? 0, msg.data, msg.sampleRate);
         if ((msg.seq ?? 0) === 0) log(`<- tts_audio_chunk stream (turn ${msg.turnId})`, "in");
       }
@@ -473,8 +560,19 @@ function handleMessage(data: unknown): void {
     }
     case "turn_complete": {
       finishTurn(msg.meta);
+      const isReplay = typeof msg.turnId === "string" && replayTurns.has(msg.turnId);
       if (pttBlocked) {
         setPipelineState("error");
+      } else if (isReplay && msg.meta?.degraded) {
+        showBanner(
+          lastRecoverableError
+            ? replayedErrorBanner(stageLabel(lastRecoverableError.stage), lastRecoverableError.message)
+            : "Replayed a degraded fixture. Live API keys were not used.",
+          "info",
+        );
+        lastRecoverableError = null;
+        lastHardError = null;
+        setPipelineState("idle");
       } else if (lastHardError) {
         showErrorBanner(lastHardError.stage, lastHardError.message, {
           recoverable: false,
@@ -504,7 +602,23 @@ function handleMessage(data: unknown): void {
       const stage = msg.stage ?? "orchestrator";
       const detail = msg.message ?? "An error occurred.";
       const recoverable = msg.recoverable !== false;
+      const isReplay =
+        (typeof msg.turnId === "string" && replayTurns.has(msg.turnId)) ||
+        ((msg.turnId == null || msg.turnId === "") &&
+          playbackTurnId != null &&
+          replayTurns.has(playbackTurnId));
       log(`<- error [${stage}] ${msg.code ?? "?"} ${detail}`, "sys");
+      if (isReplay) {
+        lastHardError = null;
+        lastRecoverableError = { stage, message: detail };
+        const rejected = msg.code === "BAD_REQUEST";
+        showBanner(
+          rejected ? detail : replayedErrorBanner(stageLabel(stage), detail),
+          rejected ? "warn" : "info",
+        );
+        setPipelineState("idle");
+        return;
+      }
       setPipelineState("error");
       if (!recoverable) {
         if (msg.code === "BREAKER_OPEN" && stage === "asr") {
@@ -565,6 +679,7 @@ connectBtn.addEventListener("click", () => {
       if (status === "disconnected") {
         void stopTalking();
         player.reset();
+        playbackTurnId = null;
         if (!intentionalDisconnect) {
           showBanner("Session lost — reconnect to continue.", "error");
           setPipelineState("error");
@@ -604,12 +719,15 @@ async function startTalking(): Promise<void> {
     captureStartAt: Date.now(),
   };
   talkSession = session;
+  turnRecordingPaths.set(session.turnId, recordingPathForTurnId(session.turnId));
 
   micError.textContent = "";
   ensureTurn(session.turnId);
   talkBtn.classList.add("recording");
   talkBtn.textContent = "Starting mic…";
   setPipelineState("listening");
+  player.reset();
+  playbackTurnId = session.turnId;
   void player.unlock();
 
   try {
@@ -713,6 +831,9 @@ async function sendTextFallback(): Promise<void> {
   const turnId = crypto.randomUUID();
   hideBanner();
   setTextFallbackVisible(false);
+  turnRecordingPaths.set(turnId, recordingPathForTurnId(turnId));
+  player.reset();
+  playbackTurnId = turnId;
   ensureTurn(turnId);
   setYou(text, true);
   setPipelineState("thinking");
@@ -725,6 +846,94 @@ textFallbackInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter") void sendTextFallback();
 });
 
+function syncReplayOptions(): void {
+  const path = recordingPathForSample(replaySample.value, replayPath.value);
+  const fullOk = fullReplayAvailable(path);
+  const fullOption = replayMode.querySelector('option[value="full"]') as HTMLOptionElement | null;
+  if (fullOption) {
+    fullOption.disabled = !fullOk;
+    fullOption.title = fullOk ? "" : "This recording has no captured audio";
+  }
+  if (!fullOk && replayMode.value === "full") {
+    replayMode.value = "events";
+  }
+  const mock = replayMode.value === "mock";
+  replayPath.hidden = false;
+  replayMockWrap.classList.toggle("visible", mock);
+  replayExtra.hidden = false;
+}
+
+function populateReplaySamples(): void {
+  replaySample.replaceChildren();
+  for (const sample of BUNDLED_SAMPLES) {
+    const option = document.createElement("option");
+    option.value = sample.path;
+    option.textContent = sample.label;
+    replaySample.appendChild(option);
+  }
+  const custom = document.createElement("option");
+  custom.value = CUSTOM_SAMPLE;
+  custom.textContent = "Custom path…";
+  replaySample.appendChild(custom);
+  replaySample.value = BUNDLED_SAMPLES[0]?.path ?? CUSTOM_SAMPLE;
+  replayPath.value = recordingPathForSample(replaySample.value, replayPath.value);
+}
+
+replaySample.addEventListener("change", () => {
+  if (replaySample.value !== CUSTOM_SAMPLE) {
+    replayPath.value = replaySample.value;
+  } else if (isBundledSamplePath(replayPath.value)) {
+    replayPath.value = "";
+  }
+  syncReplayOptions();
+});
+replayMode.addEventListener("change", () => syncReplayOptions());
+replayPath.addEventListener("input", () => syncReplayOptions());
+
+function fillReplayPath(path: string): void {
+  if (isBundledSamplePath(path)) {
+    replaySample.value = path;
+  } else {
+    replaySample.value = CUSTOM_SAMPLE;
+  }
+  replayPath.value = path;
+  syncReplayOptions();
+}
+
+function startReplay(recordingPath: string): void {
+  if (!client?.connected || talkSession) return;
+  fillReplayPath(recordingPath);
+  let mode = replayMode.value as ReplayMode;
+  if (mode === "full" && !fullReplayAvailable(recordingPath)) {
+    mode = "events";
+    replayMode.value = "events";
+    syncReplayOptions();
+  }
+  const payload = replayStartPayload({
+    recordingPath,
+    mode,
+    mockLlm: replayMockLlm.checked,
+    turnId: crypto.randomUUID(),
+  });
+  if (!payload.recordingPath) {
+    showBanner("Choose a recording or enter a path under recordings/.", "warn");
+    return;
+  }
+  player.reset();
+  playbackTurnId = payload.turnId;
+  turnRecordingPaths.set(payload.turnId, payload.recordingPath);
+  replayTurns.add(payload.turnId);
+  void player.unlock();
+  showBanner("Replaying recording…", "info");
+  setPipelineState("thinking");
+  client.replayStart(payload);
+  log(`-> replay_start ${payload.recordingPath} (${payload.mode})`, "out");
+}
+
+replayBtn.addEventListener("click", () => startReplay(replayPath.value));
+
+populateReplaySamples();
+syncReplayOptions();
 setStatus("disconnected");
 setPipelineState("idle");
 latencyUi.clear();

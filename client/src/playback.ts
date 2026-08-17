@@ -17,11 +17,18 @@ export interface PlaybackStartInfo {
 
 export type PlaybackStartHandler = (info: PlaybackStartInfo) => void;
 
+/** Drop TTS from a previous turn once a new live or replay turn owns the speaker. */
+export function shouldEnqueueTts(activeTurnId: string | null, chunkTurnId: string | undefined): boolean {
+  if (typeof chunkTurnId !== "string" || !chunkTurnId) return false;
+  return activeTurnId == null || activeTurnId === chunkTurnId;
+}
+
 export class TtsPlayer {
   private ctx: AudioContext | null = null;
   private nextStartTime = 0;
   private currentTurn: string | null = null;
   private turnStarted = false;
+  private sources: AudioBufferSourceNode[] = [];
   private readonly onPlaybackStart?: PlaybackStartHandler;
 
   constructor(onPlaybackStart?: PlaybackStartHandler) {
@@ -59,6 +66,7 @@ export class TtsPlayer {
     // an overlap. `seq` is currently advisory; chunks are assumed in order.
     const startAt = Math.max(this.nextStartTime, ctx.currentTime);
     source.start(startAt);
+    this.sources.push(source);
     this.nextStartTime = startAt + buffer.duration;
 
     if (!this.turnStarted) {
@@ -69,6 +77,7 @@ export class TtsPlayer {
 
   /** Stop any scheduled audio and forget the current turn. */
   reset(): void {
+    this.stopSources();
     if (this.ctx) {
       void this.ctx.close().catch(() => undefined);
       this.ctx = null;
@@ -78,7 +87,19 @@ export class TtsPlayer {
     this.nextStartTime = 0;
   }
 
+  private stopSources(): void {
+    for (const source of this.sources) {
+      try {
+        source.stop();
+      } catch {
+        /* already stopped */
+      }
+    }
+    this.sources = [];
+  }
+
   private beginTurn(turnId: string, ctx: AudioContext): void {
+    this.stopSources();
     this.currentTurn = turnId;
     this.turnStarted = false;
     this.nextStartTime = ctx.currentTime;

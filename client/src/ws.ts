@@ -104,6 +104,22 @@ export class VoxwireClient {
     this.send(this.envelope("text_turn", turnId, { text }));
   }
 
+  /** Replay a saved turn from a server path under RECORDINGS_DIR (issue #23). */
+  replayStart(options: {
+    recordingPath: string;
+    mode?: "events" | "full" | "mock";
+    mockLlm?: boolean;
+    turnId?: string | null;
+  }): void {
+    this.send(
+      this.envelope("replay_start", options.turnId ?? null, {
+        recordingPath: options.recordingPath,
+        mode: options.mode ?? "events",
+        mockLlm: options.mockLlm ?? false,
+      }),
+    );
+  }
+
   ping(): void {
     this.send(this.envelope("ping", null, { payload: { sentAt: Date.now() } }));
   }

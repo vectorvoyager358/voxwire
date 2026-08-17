@@ -13,11 +13,12 @@ from __future__ import annotations
 import logging
 
 import uvicorn
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 from server import __version__
 from server.config import get_settings
+from server.replay.replayer import ReplayRequest, run_replay
 from server.ws.echo import echo_session
 
 logging.basicConfig(
@@ -41,6 +42,22 @@ app.add_middleware(
 async def health() -> dict[str, str]:
     """Liveness probe with version info."""
     return {"status": "ok", "version": __version__}
+
+
+@app.post("/replay")
+async def replay_turn(body: ReplayRequest) -> dict:
+    """Replay a recording without a live microphone."""
+    settings = get_settings()
+    events: list[dict] = []
+
+    async def send(event: dict) -> None:
+        events.append(event)
+
+    try:
+        metadata = await run_replay(body, send, settings)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"metadata": metadata, "mode": body.mode, "events": events}
 
 
 @app.websocket("/ws/session/{session_id}")

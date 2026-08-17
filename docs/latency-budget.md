@@ -1,9 +1,9 @@
 # Latency budget
 
 This document defines **what we measure**, **where we mark it**, and **how it
-maps to the `latency_report` event** emitted at the end of each turn (Phase 2,
-issues #15–#17). It is the spec implementors follow before adding code in
-`server/latency/` and the client UI.
+maps to the `latency_report` event** emitted at the end of each turn.
+`LatencyTracker` (`server/latency/`) records the marks; the client waterfall
+and last-N table render the report plus felt latency.
 
 Related: [`event-protocol.md`](event-protocol.md) (wire format),
 [`architecture.md`](architecture.md) (component boundaries).
@@ -16,7 +16,7 @@ Related: [`event-protocol.md`](event-protocol.md) (wire format),
 2. **Measure at our boundaries** — when voxwire sends/receives bytes to/from a
    provider adapter, not inside vendor SDKs.
 3. **Use monotonic clocks on the server** — client and server wall clocks are not
-   assumed to be synchronized (see [Clock domains](#clock-domains)).
+   assumed to be synchronized (see [Clock domains](event-protocol.md#clock-domains)).
 4. **Support felt latency** — the user cares about “release button → hear reply”;
    that requires one client-side mark at playback start.
 
@@ -40,8 +40,8 @@ complete.” Everything through `turn_complete` is measured from here.
 
 ## Wire event: `latency_report`
 
-Emitted once per turn, embedded in `turn_complete.meta.latency_report` (issue
-#16). Standalone shape for reference:
+Emitted once per turn, embedded in `turn_complete.meta.latency_report`.
+Standalone shape for reference:
 
 ```json
 {
@@ -50,6 +50,8 @@ Emitted once per turn, embedded in `turn_complete.meta.latency_report` (issue
   "turnId": "...",
   "timestamp": 1718766004800,
   "totalMs": 1200,
+  "bottleneckStage": "llm",
+  "failedStage": null,
   "stages": {
     "clientCaptureMs": 850,
     "audioUploadMs": 40,
@@ -60,6 +62,12 @@ Emitted once per turn, embedded in `turn_complete.meta.latency_report` (issue
     "ttsTtfbMs": 120,
     "ttsCompleteMs": 280,
     "orchestrationOverheadMs": 45
+  },
+  "meta": {
+    "totalMs": 1200,
+    "bottleneckStage": "llm",
+    "failedStage": null,
+    "degraded": false
   }
 }
 ```
@@ -68,6 +76,9 @@ Emitted once per turn, embedded in `turn_complete.meta.latency_report` (issue
 |-------|------|---------|
 | `totalMs` | number | `turn_complete` − T₀ (server monotonic, rounded to ms) |
 | `stages` | object | Per-stage deltas (see [Stage fields](#stage-fields)) |
+| `bottleneckStage` | string \| null | Longest non-overhead server timeline segment (`asr` / `llm` / `tts`), else `overhead` |
+| `failedStage` | string \| null | First failed pipeline stage, if any |
+| `meta` | object | `{ totalMs, bottleneckStage, failedStage, degraded }` |
 
 If a stage did not run (empty transcript, degraded turn), its field is **`null`**
 (not `0`) so the UI can distinguish “skipped” from “instant.”
@@ -86,7 +97,7 @@ Each row: **field name**, **definition**, **start mark → end mark**, **clock**
 | **Start** | `capture_start` — `AudioCapture.start()` resolved (mic live). |
 | **End** | `capture_end` — client sends `utterance_end`. |
 | **Clock** | Client `Date.now()` (same origin; not compared to server). |
-| **Source** | Client sends `{ captureMs }` on `utterance_end` (optional field, issue #15). Server copies into report unchanged. |
+| **Source** | Client sends `{ captureMs }` on `utterance_end` (optional). Server copies into report unchanged. |
 
 This is **not** relative to T₀; it explains how much audio was recorded, not
 server processing time.
@@ -178,7 +189,7 @@ If TTS is skipped (`ttsSkipped: true`), this field is `null`.
 
 ## Overhead calculation
 
-Provider windows (server monotonic, pairwise non-overlapping spans):
+Provider windows (server monotonic):
 
 ```
 asrWindow   = asr_final   − T₀
@@ -186,8 +197,10 @@ llmWindow   = llm_complete − llm_start
 ttsWindow   = tts_complete − tts_start
 ```
 
-These may **overlap** (TTS while LLM still streaming). Overhead is the residual
-after subtracting the **union** of busy intervals from `totalMs`:
+Windows may overlap in the formula (the tracker unions busy intervals). The
+current orchestrator starts TTS only after `llm_complete`, so LLM and TTS
+windows do not overlap in practice. Overhead is the residual after subtracting
+the **union** of busy intervals from `totalMs`:
 
 ```
 busyMs = length( union( [T₀, asr_final], [llm_start, llm_complete], [tts_start, tts_complete] ) )
@@ -204,8 +217,8 @@ produces a small negative.
 
 ## Server marks (complete list)
 
-Recorded by `LatencyTracker` (issue #15) inside `PipelineOrchestrator` unless
-noted. Storage: `time.perf_counter()`; convert to ms with `(t − T₀) * 1000`.
+Recorded by `LatencyTracker` inside `PipelineOrchestrator` unless noted.
+Storage: `time.perf_counter()`; convert to ms with `(t − T₀) * 1000`.
 
 | Mark | Trigger |
 |------|---------|
@@ -248,12 +261,9 @@ User-perceived “release → hear reply”:
 feltLatencyMs = playback_start − utterance_end_sent
 ```
 
-Issue #17 displays this in the waterfall UI alongside server `latency_report`
-fields. The client may send `feltLatencyMs` back in a future `turn_ack` or log
-locally only in v1.
-
-`playback_start` is already hooked in `client/src/main.ts` (debug log today;
-UI in #17).
+The client waterfall shows this alongside server `latency_report` fields. It is
+computed locally (`playback_start − utterance_end_sent`) and is not sent back
+to the server.
 
 ---
 
@@ -303,6 +313,7 @@ Example `turn_complete` excerpt:
   "turnId": "a1b2...",
   "meta": {
     "degraded": false,
+    "degradedMode": null,
     "ttsSkipped": false,
     "ttsChunks": 12,
     "latency_report": {
@@ -329,14 +340,12 @@ Example `turn_complete` excerpt:
 
 ---
 
-## Implementation notes (issues #15–#17)
+## Implementation notes
 
-| Issue | Work |
-|-------|------|
-| **#15** | `LatencyTracker` in `server/latency/`; orchestrator calls `mark()` at each row above |
-| **#16** | Attach aggregated report to `turn_complete.meta.latency_report` |
-| **#17** | Client waterfall + last-N table; render `stages` + `feltLatencyMs` |
-| **#16 (degraded)** | On stage error, freeze marks at failure point; remaining stages `null` |
+`LatencyTracker` lives in `server/latency/`. The orchestrator calls `mark()` at
+each row above, attaches the aggregated report to `turn_complete.meta.latency_report`,
+and the client renders `stages` plus felt latency. On stage error, remaining
+stage fields stay `null` and `failedStage` is set.
 
 ### Rounding
 
@@ -346,15 +355,17 @@ Example `turn_complete` excerpt:
 
 ### Testing
 
-- Unit-test `LatencyTracker` mark ordering and overhead union math with synthetic
-  timestamps (issue #15).
-- Golden JSON fixture for one happy-path turn in `tests/fixtures/latency_report.json`.
+- `tests/test_latency.py` covers mark ordering, overhead union math, and
+  orchestrator emission.
+- `recordings/samples/degraded-llm-config.jsonl` is a degraded-turn fixture
+  replayed in CI.
 
 ---
 
 ## Budget targets (informational)
 
-Not enforced in Phase 2; used for UI coloring in #17.
+Used for UI coloring; not hard-failed. Stage **deadlines** (when the turn
+degrades) are the timeout settings in `.env.example` / the README.
 
 | Stage | Target | Notes |
 |-------|--------|-------|
@@ -362,5 +373,3 @@ Not enforced in Phase 2; used for UI coloring in #17.
 | `llmTtftMs` | < 400 ms | Gemini Flash class models |
 | `ttsTtfbMs` | < 200 ms | Cartesia streaming |
 | `feltLatencyMs` | < 1500 ms | End-to-end UX goal |
-
-Adjust per deployment; see Phase 3 timeouts (#19) for enforcement.

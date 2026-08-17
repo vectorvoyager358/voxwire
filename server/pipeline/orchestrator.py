@@ -41,9 +41,9 @@ from server.pipeline.errors import (
     classify_provider_error,
     error_recoverable,
 )
-from server.providers.asr import ASRSession, Transcript, get_asr_provider
-from server.providers.llm import get_llm_provider
-from server.providers.tts import TTS_ENCODING, TTS_SAMPLE_RATE, get_tts_provider
+from server.providers.asr import ASRProvider, ASRSession, Transcript, get_asr_provider
+from server.providers.llm import LLMProvider, get_llm_provider
+from server.providers.tts import TTS_ENCODING, TTS_SAMPLE_RATE, TTSProvider, get_tts_provider
 from server.replay.recorder import TurnRecorder
 from server.resilience import (
     StageBreakers,
@@ -115,10 +115,22 @@ class TurnStats:
 class PipelineOrchestrator:
     """One orchestrator per WebSocket session; reusable across turns."""
 
-    def __init__(self, session_id: str, send: Send, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        send: Send,
+        settings: Settings | None = None,
+        *,
+        asr_provider: ASRProvider | None = None,
+        llm_provider: LLMProvider | None = None,
+        tts_provider: TTSProvider | None = None,
+    ) -> None:
         self._session_id = session_id
         self._send = send
         self._settings = settings if settings is not None else get_settings()
+        self._asr_override = asr_provider
+        self._llm_override = llm_provider
+        self._tts_override = tts_provider
         self._stats = TurnStats()
         self._asr_session: ASRSession | None = None
         self._asr_turn_id: str | None = None
@@ -426,7 +438,7 @@ class PipelineOrchestrator:
             )
 
         try:
-            provider = get_asr_provider(self._settings)
+            provider = self._asr_override or get_asr_provider(self._settings)
             return await run_with_timeout_and_retry(
                 lambda: provider.start(on_transcript),
                 stage="asr",
@@ -511,7 +523,7 @@ class PipelineOrchestrator:
             return "", 0, breaker_message("llm"), True
 
         try:
-            provider = get_llm_provider(self._settings)
+            provider = self._llm_override or get_llm_provider(self._settings)
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
             logger.exception("llm start failed session=%s turn=%s", self._session_id, turn_id)
@@ -606,7 +618,7 @@ class PipelineOrchestrator:
                 tts_error = breaker_message("tts")
             else:
                 try:
-                    provider = get_tts_provider(self._settings)
+                    provider = self._tts_override or get_tts_provider(self._settings)
                 except Exception as exc:  # noqa: BLE001
                     tts_error = str(exc)
                     logger.exception(
