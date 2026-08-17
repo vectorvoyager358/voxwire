@@ -214,6 +214,58 @@
         color: var(--accent);
         background: #151922;
       }
+      .turn-badge.replay {
+        border-color: #4a3a6a;
+        color: #c4b5fd;
+        background: #1a1524;
+      }
+      .turn-id {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+        color: var(--muted);
+        max-width: 220px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .turn-replay {
+        font-size: 12px;
+        padding: 4px 10px;
+      }
+      .latency-table .latency-replay {
+        font-size: 12px;
+        padding: 4px 10px;
+      }
+      .replay-panel { margin: 0 0 16px; }
+      .replay-label {
+        display: block;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        margin: 0 0 8px;
+      }
+      .replay-panel select,
+      .replay-panel input[type="text"] {
+        flex: 1;
+        min-width: 0;
+        padding: 8px 10px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--text);
+        font-size: 14px;
+      }
+      .replay-check {
+        display: none;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .replay-check.visible { display: flex; }
       .bubble {
         background: #0b0d12;
         border: 1px solid var(--border);
@@ -453,7 +505,7 @@
   <body>
     <main class="card">
       <h1>voxwire</h1>
-      <p class="sub">Connect, hold to talk, and watch your words stream back as speech.</p>
+      <p class="sub">Realtime voice assistant — hold to talk, see the transcript, hear the reply.</p>
       <p id="pipelineState" class="pipeline-state" aria-live="polite">Idle</p>
       <div id="banner" class="banner" role="alert">
         <p id="bannerStage" class="banner-stage" hidden></p>
@@ -477,6 +529,26 @@
       </div>
       <p id="micError" class="mic-error"></p>
 
+      <div class="replay-panel">
+        <p class="replay-label">Replay recording</p>
+        <div class="row">
+          <select id="replaySample" disabled></select>
+          <select id="replayMode" disabled>
+            <option value="events">Events</option>
+            <option value="full">Full pipeline</option>
+            <option value="mock">Mock (skip ASR)</option>
+          </select>
+          <button id="replay" class="secondary" disabled>Replay</button>
+        </div>
+        <div id="replayExtra" class="row" hidden>
+          <input id="replayPath" type="text" value="samples/hello-turn.jsonl" placeholder="turnId.jsonl (live) or samples/hello-turn.jsonl" autocomplete="off" disabled />
+          <label id="replayMockWrap" class="replay-check">
+            <input id="replayMockLlm" type="checkbox" disabled />
+            Mock LLM/TTS
+          </label>
+        </div>
+      </div>
+
       <div id="textFallback" class="text-fallback">
         <input id="textFallbackInput" type="text" placeholder="Type your message…" autocomplete="off" />
         <button id="textFallbackSend" type="button">Send</button>
@@ -495,6 +567,7 @@
               <th>Total</th>
               <th>Felt</th>
               <th>Bottleneck</th>
+              <th></th>
             </tr>
           </thead>
           <tbody id="latencyTableBody"></tbody>

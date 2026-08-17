@@ -11,9 +11,11 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
 
 from server.config import get_settings
 from server.pipeline.orchestrator import PipelineOrchestrator
+from server.replay.replayer import ReplayRequest, replay_error_payload, run_replay
 
 logger = logging.getLogger("voxwire.ws")
 
@@ -76,6 +78,21 @@ async def echo_session(websocket: WebSocket, session_id: str) -> None:
 
             elif msg_type == "text_turn":
                 await pipeline.on_text_turn(message)
+
+            elif msg_type == "replay_start":
+                turn_id = message.get("turnId")
+                try:
+                    request = ReplayRequest.model_validate({**message, "sessionId": session_id})
+                    turn_id = request.turn_id
+                    await run_replay(request, send, settings, orchestrator=pipeline)
+                except (ValidationError, ValueError, OSError) as exc:
+                    await send(
+                        replay_error_payload(
+                            session_id,
+                            exc,
+                            turn_id if isinstance(turn_id, str) else None,
+                        )
+                    )
 
             else:
                 await send(

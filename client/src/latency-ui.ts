@@ -156,6 +156,7 @@ export class LatencyUi {
     private readonly statsEl: HTMLElement,
     private readonly waterfallEl: HTMLElement,
     private readonly tableBody: HTMLElement,
+    private readonly onReplayTurn?: (turnId: string) => void,
   ) {}
 
   recordTurn(
@@ -407,12 +408,30 @@ export class LatencyUi {
       const bn = row.bottleneckStage;
       const bnLabel = bn ? (STAGE_LABELS[bn] ?? bn) : "—";
 
-      for (const text of [shortTurnId(row.turnId), formatMs(row.totalMs), formatMs(row.feltMs), bnLabel]) {
+      const turnTd = document.createElement("td");
+      turnTd.textContent = shortTurnId(row.turnId);
+      turnTd.title = row.turnId;
+      tr.appendChild(turnTd);
+
+      for (const text of [formatMs(row.totalMs), formatMs(row.feltMs), bnLabel]) {
         const td = document.createElement("td");
         td.textContent = text;
         if (text === bnLabel && bn) td.classList.add("bottleneck-cell");
         tr.appendChild(td);
       }
+
+      const replayTd = document.createElement("td");
+      if (this.onReplayTurn) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "secondary latency-replay";
+        btn.textContent = "Replay";
+        btn.title = `Replay ${row.turnId}`;
+        btn.addEventListener("click", () => this.onReplayTurn?.(row.turnId));
+        replayTd.appendChild(btn);
+      }
+      tr.appendChild(replayTd);
+
       this.tableBody.appendChild(tr);
     }
   }
